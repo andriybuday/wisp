@@ -14,5 +14,12 @@ A minimalist terminal emulator.
 ## Building
 Instructions coming soon.
 
+## Tech Stack
+- Rust
+- wgpu (GPU rendering)
+- winit (windowing)
+- portable-pty (shell integration)
+- vte (ANSI parsing)
+
 ## License
-TBD
+MIT
