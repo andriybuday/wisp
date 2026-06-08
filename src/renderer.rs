@@ -1,10 +1,10 @@
 use std::sync::Arc;
-use winit::{dpi::PhysicalSize, window::Window};
 use wgpu::util::DeviceExt;
+use winit::{dpi::PhysicalSize, window::Window};
 
-use crate::config::{Config, ColorPalette};
-use crate::terminal::Terminal;
+use crate::config::{ColorPalette, Config};
 use crate::font::FontManager;
+use crate::terminal::Terminal;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -58,15 +58,17 @@ pub struct Renderer {
 impl Renderer {
     pub fn new(window: Arc<Window>, terminal_config: &Config) -> Self {
         let size = window.inner_size();
-        
+
         // Create wgpu instance
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
             ..Default::default()
         });
-        
-        let surface = instance.create_surface(window).expect("Failed to create surface");
-        
+
+        let surface = instance
+            .create_surface(window)
+            .expect("Failed to create surface");
+
         // Request adapter
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::default(),
@@ -74,7 +76,7 @@ impl Renderer {
             force_fallback_adapter: false,
         }))
         .expect("Failed to find adapter");
-        
+
         // Request device
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
@@ -86,7 +88,7 @@ impl Renderer {
             None,
         ))
         .expect("Failed to create device");
-        
+
         let surface_caps = surface.get_capabilities(&adapter);
         let surface_format = surface_caps
             .formats
@@ -94,7 +96,7 @@ impl Renderer {
             .copied()
             .find(|f| f.is_srgb())
             .unwrap_or(surface_caps.formats[0]);
-        
+
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
@@ -105,18 +107,18 @@ impl Renderer {
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
-        
+
         surface.configure(&device, &config);
-        
+
         let mut font_manager = FontManager::new(terminal_config.font_size);
-        
+
         // Create texture for glyph atlas (simple 1024x1024 for now)
         let texture_size = wgpu::Extent3d {
             width: 1024,
             height: 1024,
             depth_or_array_layers: 1,
         };
-        
+
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Glyph Atlas"),
             size: texture_size,
@@ -127,9 +129,9 @@ impl Renderer {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        
+
         let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        
+
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
@@ -139,7 +141,7 @@ impl Renderer {
             mipmap_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
-        
+
         let texture_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 entries: &[
@@ -162,7 +164,7 @@ impl Renderer {
                 ],
                 label: Some("texture_bind_group_layout"),
             });
-        
+
         let texture_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout: &texture_bind_group_layout,
             entries: &[
@@ -177,19 +179,19 @@ impl Renderer {
             ],
             label: Some("texture_bind_group"),
         });
-        
+
         // Create render pipeline
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
         });
-        
+
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Render Pipeline Layout"),
             bind_group_layouts: &[&texture_bind_group_layout],
             push_constant_ranges: &[],
         });
-        
+
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Render Pipeline"),
             layout: Some(&pipeline_layout),
@@ -227,7 +229,7 @@ impl Renderer {
             multiview: None,
             cache: None,
         });
-        
+
         Self {
             surface,
             device,
@@ -243,7 +245,7 @@ impl Renderer {
             texture_bind_group,
         }
     }
-    
+
     pub fn resize(&mut self, new_size: PhysicalSize<u32>) {
         if new_size.width > 0 && new_size.height > 0 {
             self.size = new_size;
@@ -252,31 +254,72 @@ impl Renderer {
             self.surface.configure(&self.device, &self.config);
         }
     }
-    
+
     pub fn render(&mut self, terminal: &Terminal) {
-        let output = self.surface.get_current_texture().expect("Failed to get surface texture");
-        let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("Render Encoder"),
-        });
-        
+        let output = self
+            .surface
+            .get_current_texture()
+            .expect("Failed to get surface texture");
+        let view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Render Encoder"),
+            });
+
         // Build vertices for all visible characters
         let vertices = self.build_vertices(terminal);
         let indices = self.build_indices(vertices.len() / 4);
-        
-        let vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Vertex Buffer"),
-            contents: bytemuck::cast_slice(&vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        
-        let index_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Index Buffer"),
-            contents: bytemuck::cast_slice(&indices),
-            usage: wgpu::BufferUsages::INDEX,
-        });
-        
+
+        // If there are no vertices to render, just clear the screen and present
+        if vertices.is_empty() || indices.is_empty() {
+            {
+                let _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Render Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: self.color_palette.background[0] as f64,
+                                g: self.color_palette.background[1] as f64,
+                                b: self.color_palette.background[2] as f64,
+                                a: self.color_palette.background[3] as f64,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    occlusion_query_set: None,
+                    timestamp_writes: None,
+                });
+                // Render pass is dropped here, which clears the screen
+            }
+
+            self.queue.submit(std::iter::once(encoder.finish()));
+            output.present();
+            return;
+        }
+
+        let vertex_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Vertex Buffer"),
+                contents: bytemuck::cast_slice(&vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+
+        let index_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Index Buffer"),
+                contents: bytemuck::cast_slice(&indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Render Pass"),
@@ -297,42 +340,42 @@ impl Renderer {
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
-            
+
             render_pass.set_pipeline(&self.pipeline);
             render_pass.set_bind_group(0, &self.texture_bind_group, &[]);
             render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
             render_pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint16);
             render_pass.draw_indexed(0..indices.len() as u32, 0, 0..1);
         }
-        
+
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
     }
-    
+
     fn build_vertices(&mut self, terminal: &Terminal) -> Vec<Vertex> {
         let mut vertices = Vec::new();
-        
+
         let cell_width = self.font_manager.cell_width();
         let cell_height = self.font_manager.cell_height();
-        
+
         let width_ndc = 2.0 / self.size.width as f32;
         let height_ndc = 2.0 / self.size.height as f32;
-        
+
         for row in 0..terminal.rows() {
             for col in 0..terminal.cols() {
                 if let Some(cell) = terminal.get_cell(col, row) {
                     if cell.ch == ' ' {
                         continue;
                     }
-                    
+
                     let glyph = self.font_manager.get_glyph(cell.ch);
-                    
+
                     // Upload glyph to texture atlas at a simple position
                     // For MVP, we'll just use a fixed position per character
                     // This is inefficient but works for demonstration
                     let atlas_x = (cell.ch as u32 % 32) * 32;
                     let atlas_y = (cell.ch as u32 / 32) * 32;
-                    
+
                     if !glyph.bitmap.is_empty() {
                         self.queue.write_texture(
                             wgpu::ImageCopyTexture {
@@ -358,45 +401,58 @@ impl Renderer {
                             },
                         );
                     }
-                    
+
                     let x = col as f32 * cell_width + self.terminal_config.padding;
                     let y = row as f32 * cell_height + self.terminal_config.padding;
-                    
+
                     // Convert to NDC
                     let x_ndc = x * width_ndc - 1.0;
                     let y_ndc = 1.0 - y * height_ndc;
                     let w_ndc = glyph.width as f32 * width_ndc;
                     let h_ndc = glyph.height as f32 * height_ndc;
-                    
+
                     let u0 = atlas_x as f32 / 1024.0;
                     let v0 = atlas_y as f32 / 1024.0;
                     let u1 = (atlas_x + glyph.width as u32) as f32 / 1024.0;
                     let v1 = (atlas_y + glyph.height as u32) as f32 / 1024.0;
-                    
+
                     let color = self.color_palette.ansi[cell.fg as usize];
-                    
+
                     // Create quad (two triangles)
                     vertices.extend_from_slice(&[
-                        Vertex { position: [x_ndc, y_ndc, 0.0], tex_coords: [u0, v0], color },
-                        Vertex { position: [x_ndc + w_ndc, y_ndc, 0.0], tex_coords: [u1, v0], color },
-                        Vertex { position: [x_ndc + w_ndc, y_ndc - h_ndc, 0.0], tex_coords: [u1, v1], color },
-                        Vertex { position: [x_ndc, y_ndc - h_ndc, 0.0], tex_coords: [u0, v1], color },
+                        Vertex {
+                            position: [x_ndc, y_ndc, 0.0],
+                            tex_coords: [u0, v0],
+                            color,
+                        },
+                        Vertex {
+                            position: [x_ndc + w_ndc, y_ndc, 0.0],
+                            tex_coords: [u1, v0],
+                            color,
+                        },
+                        Vertex {
+                            position: [x_ndc + w_ndc, y_ndc - h_ndc, 0.0],
+                            tex_coords: [u1, v1],
+                            color,
+                        },
+                        Vertex {
+                            position: [x_ndc, y_ndc - h_ndc, 0.0],
+                            tex_coords: [u0, v1],
+                            color,
+                        },
                     ]);
                 }
             }
         }
-        
+
         vertices
     }
-    
+
     fn build_indices(&self, quad_count: usize) -> Vec<u16> {
         let mut indices = Vec::new();
         for i in 0..quad_count {
             let base = (i * 4) as u16;
-            indices.extend_from_slice(&[
-                base, base + 1, base + 2,
-                base, base + 2, base + 3,
-            ]);
+            indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
         }
         indices
     }
