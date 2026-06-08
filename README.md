@@ -21,7 +21,41 @@ A minimalist terminal emulator.
 - Essential features only
 
 ## Building
-Instructions coming soon.
+
+### Prerequisites
+- Rust (install from https://rustup.rs)
+- macOS/Linux/Windows
+
+### Build and Run
+```bash
+cargo build --release
+cargo run --release
+```
+
+### Development
+```bash
+# Quick build (debug mode)
+cargo build
+
+# Run
+cargo run
+
+# Check for errors
+cargo check
+```
+
+## Current Features
+
+✅ Basic window and rendering  
+✅ Shell integration (PTY)  
+✅ Keyboard input  
+✅ ANSI escape sequences  
+✅ Scrollback buffer  
+⏳ Text selection (coming soon)  
+⏳ Copy/paste (coming soon)  
+⏳ Color rendering (coming soon)  
+
+See [STATUS.md](STATUS.md) for detailed progress.
 
 ## Tech Stack
 - Rust
