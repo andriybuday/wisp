@@ -20,7 +20,7 @@ fn main() {
     let event_loop = EventLoop::new().expect("Failed to create event loop");
     let mut wisp_window = WispWindow::new(&event_loop);
     
-    event_loop.set_control_flow(ControlFlow::Wait);
+    event_loop.set_control_flow(ControlFlow::Poll);
     
     event_loop.run(move |event, elwt| {
         match event {
