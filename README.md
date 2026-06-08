@@ -5,6 +5,15 @@ A minimalist terminal emulator.
 ## Status
 🚧 Work in progress - MVP development
 
+### Current Progress
+- ✅ Basic window creation
+- ✅ GPU-accelerated rendering (wgpu)
+- ✅ Text rendering with monospace font
+- ⏳ PTY integration (shell spawning)
+- ⏳ ANSI escape sequence parsing
+- ⏳ Keyboard input handling
+- ⏳ Text selection & clipboard
+
 ## Goals
 - Simple and focused
 - Fast and lightweight
