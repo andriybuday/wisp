@@ -8,15 +8,21 @@ license = "MIT"
 
 [dependencies]
 # UI Framework - using winit for cross-platform window creation
-winit = "0.29"
+winit = "0.30"
 # GPU rendering with wgpu
-wgpu = "0.18"
+wgpu = "23"
 # Font rendering
-fontdue = "0.8"
+fontdue = "0.9"
 # PTY handling
 portable-pty = "0.8"
 # ANSI parser
 vte = "0.13"
+# Async runtime helper
+pollster = "0.3"
+# Bitflags for cell attributes
+bitflags = "2.6"
+# Logging
+env_logger = "0.11"
 
 [profile.release]
 opt-level = 3
