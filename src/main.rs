@@ -7,6 +7,7 @@ mod window;
 mod renderer;
 mod terminal;
 mod config;
+mod font;
 
 use window::WispWindow;
 
