@@ -1,5 +1,5 @@
 use winit::{
-    event::{Event, WindowEvent},
+    event::{Event, WindowEvent, ElementState},
     event_loop::{ControlFlow, EventLoop},
 };
 
@@ -8,6 +8,9 @@ mod renderer;
 mod terminal;
 mod config;
 mod font;
+mod pty;
+mod parser;
+mod input;
 
 use window::WispWindow;
 
@@ -33,6 +36,13 @@ fn main() {
                     }
                     WindowEvent::RedrawRequested => {
                         wisp_window.render();
+                    }
+                    WindowEvent::KeyboardInput { event, .. } => {
+                        if event.state == ElementState::Pressed {
+                            if let Some(bytes) = input::key_to_bytes(event.physical_key, &event.text.as_ref().map(|s| s.as_str()).unwrap_or("")) {
+                                wisp_window.send_input(&bytes);
+                            }
+                        }
                     }
                     _ => {}
                 }

@@ -8,11 +8,14 @@ use winit::{
 use crate::config::Config;
 use crate::renderer::Renderer;
 use crate::terminal::Terminal;
+use crate::pty::PtyManager;
+use crate::parser::AnsiParser;
 
 pub struct WispWindow {
     window: Arc<Window>,
     renderer: Renderer,
-    terminal: Terminal,
+    parser: AnsiParser,
+    pty: PtyManager,
 }
 
 impl WispWindow {
@@ -35,11 +38,15 @@ impl WispWindow {
         
         let renderer = Renderer::new(window.clone(), &config);
         let terminal = Terminal::new(config.cols, config.rows);
+        let parser = AnsiParser::new(terminal);
+        let pty = PtyManager::new(config.cols as u16, config.rows as u16)
+            .expect("Failed to create PTY");
         
         Self {
             window,
             renderer,
-            terminal,
+            parser,
+            pty,
         }
     }
     
@@ -53,6 +60,15 @@ impl WispWindow {
     }
     
     pub fn render(&mut self) {
-        self.renderer.render(&self.terminal);
+        // Read from PTY and process
+        while let Some(data) = self.pty.try_read() {
+            self.parser.advance(&data);
+        }
+        
+        self.renderer.render(self.parser.terminal());
+    }
+    
+    pub fn send_input(&mut self, data: &[u8]) {
+        let _ = self.pty.write(data);
     }
 }
