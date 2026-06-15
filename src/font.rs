@@ -57,4 +57,13 @@ impl FontManager {
     pub fn cell_height(&self) -> f32 {
         self.font_size * 1.3
     }
+
+    /// Distance from the top of a line to the text baseline, in pixels.
+    /// Used to sit every glyph on a common baseline.
+    pub fn ascent(&self) -> f32 {
+        self.font
+            .horizontal_line_metrics(self.font_size)
+            .map(|m| m.ascent)
+            .unwrap_or(self.font_size * 0.8)
+    }
 }

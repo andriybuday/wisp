@@ -409,6 +409,7 @@ impl Renderer {
 
         let cell_width = self.font_manager.cell_width();
         let cell_height = self.font_manager.cell_height();
+        let ascent = self.font_manager.ascent();
 
         let width_ndc = 2.0 / self.size.width as f32;
         let height_ndc = 2.0 / self.size.height as f32;
@@ -537,26 +538,36 @@ impl Renderer {
                     let u1 = (atlas_x + gw) as f32 / ATLAS_SIZE as f32;
                     let v1 = (atlas_y + gh) as f32 / ATLAS_SIZE as f32;
 
+                    // Position the glyph on the text baseline using fontdue's
+                    // per-glyph bearings (xmin / ymin), so glyphs of different
+                    // sizes line up instead of all sticking to the cell top.
+                    // ymin is the offset from baseline to the bitmap bottom, so
+                    // the bitmap top sits (ymin + height) above the baseline.
+                    let baseline = y + ascent;
+                    let glyph_left = x + glyph.offset_x as f32;
+                    let glyph_top = baseline - (glyph.offset_y as f32 + glyph.height as f32);
+                    let gx_ndc = glyph_left * width_ndc - 1.0;
+                    let gy_ndc = 1.0 - glyph_top * height_ndc;
+
                     // Create quad (two triangles) for the glyph
-                    // Position at cell top-left (simple positioning for MVP)
                     vertices.extend_from_slice(&[
                         Vertex {
-                            position: [x_ndc, y_ndc, 0.0],
+                            position: [gx_ndc, gy_ndc, 0.0],
                             tex_coords: [u0, v0],
                             color: fg_color,
                         },
                         Vertex {
-                            position: [x_ndc + w_ndc, y_ndc, 0.0],
+                            position: [gx_ndc + w_ndc, gy_ndc, 0.0],
                             tex_coords: [u1, v0],
                             color: fg_color,
                         },
                         Vertex {
-                            position: [x_ndc + w_ndc, y_ndc - h_ndc, 0.0],
+                            position: [gx_ndc + w_ndc, gy_ndc - h_ndc, 0.0],
                             tex_coords: [u1, v1],
                             color: fg_color,
                         },
                         Vertex {
-                            position: [x_ndc, y_ndc - h_ndc, 0.0],
+                            position: [gx_ndc, gy_ndc - h_ndc, 0.0],
                             tex_coords: [u0, v1],
                             color: fg_color,
                         },
