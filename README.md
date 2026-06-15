@@ -55,8 +55,9 @@ cargo check
 ✅ Text attributes (bold, underline, inverse)  
 ✅ Visual cursor  
 ✅ PTY resize on window resize  
-⏳ Text selection (coming soon)  
-⏳ Copy/paste (coming soon)  
+✅ Text selection (mouse drag)  
+✅ Copy/paste (Cmd+C / Cmd+V on macOS)  
+✅ Scrollback navigation (mouse wheel)  
 
 See [STATUS.md](STATUS.md) for detailed progress.
 
