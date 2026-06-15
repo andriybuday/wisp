@@ -49,6 +49,8 @@ pub struct Terminal {
     current_flags: CellFlags,
     /// Cursor visible
     cursor_visible: bool,
+    /// Bracketed paste mode (DEC private mode 2004) is enabled
+    bracketed_paste: bool,
 }
 
 impl Terminal {
@@ -66,11 +68,20 @@ impl Terminal {
             current_bg: 0, // Default black
             current_flags: CellFlags::empty(),
             cursor_visible: true,
+            bracketed_paste: false,
         }
     }
 
     pub fn cols(&self) -> usize {
         self.cols
+    }
+
+    pub fn bracketed_paste(&self) -> bool {
+        self.bracketed_paste
+    }
+
+    pub fn set_bracketed_paste(&mut self, enabled: bool) {
+        self.bracketed_paste = enabled;
     }
 
     pub fn rows(&self) -> usize {

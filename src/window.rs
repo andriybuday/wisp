@@ -17,6 +17,7 @@ pub struct WispWindow {
     parser: AnsiParser,
     pty: PtyManager,
     config: Config,
+    clipboard: Option<arboard::Clipboard>,
 }
 
 impl WispWindow {
@@ -53,12 +54,17 @@ impl WispWindow {
         let pty =
             PtyManager::new(config.cols as u16, config.rows as u16).expect("Failed to create PTY");
 
+        let clipboard = arboard::Clipboard::new()
+            .map_err(|e| eprintln!("Clipboard unavailable: {e}"))
+            .ok();
+
         Self {
             window,
             renderer,
             parser,
             pty,
             config,
+            clipboard,
         }
     }
 
@@ -108,5 +114,31 @@ impl WispWindow {
 
     pub fn send_input(&mut self, data: &[u8]) {
         let _ = self.pty.write(data);
+    }
+
+    /// Paste the clipboard text into the shell. When the application has
+    /// enabled bracketed paste (DEC 2004), wrap the text in the paste markers
+    /// so multi-line content isn't executed line-by-line.
+    pub fn paste(&mut self) {
+        let Some(clipboard) = self.clipboard.as_mut() else {
+            return;
+        };
+        let Ok(text) = clipboard.get_text() else {
+            return;
+        };
+        if text.is_empty() {
+            return;
+        }
+
+        if self.parser.terminal().bracketed_paste() {
+            // Strip any embedded end marker so pasted content can't spoof the
+            // end of the paste and inject commands.
+            let sanitized = text.replace("\x1b[201~", "");
+            let _ = self.pty.write(b"\x1b[200~");
+            let _ = self.pty.write(sanitized.as_bytes());
+            let _ = self.pty.write(b"\x1b[201~");
+        } else {
+            let _ = self.pty.write(text.as_bytes());
+        }
     }
 }
