@@ -1,31 +1,30 @@
 use winit::{
-    event::{Event, WindowEvent, ElementState},
+    event::{ElementState, Event, Ime, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
 };
 
-mod window;
-mod renderer;
-mod terminal;
 mod config;
 mod font;
-mod pty;
-mod parser;
 mod input;
+mod parser;
+mod pty;
+mod renderer;
+mod terminal;
+mod window;
 
 use window::WispWindow;
 
 fn main() {
     env_logger::init();
-    
+
     let event_loop = EventLoop::new().expect("Failed to create event loop");
     let mut wisp_window = WispWindow::new(&event_loop);
-    
+
     event_loop.set_control_flow(ControlFlow::Poll);
-    
-    event_loop.run(move |event, elwt| {
-        match event {
-            Event::WindowEvent { event, window_id } 
-                if window_id == wisp_window.window().id() => {
+
+    event_loop
+        .run(move |event, elwt| match event {
+            Event::WindowEvent { event, window_id } if window_id == wisp_window.window().id() => {
                 match event {
                     WindowEvent::CloseRequested => {
                         println!("Close requested, exiting...");
@@ -39,11 +38,29 @@ fn main() {
                     }
                     WindowEvent::KeyboardInput { event, .. } => {
                         if event.state == ElementState::Pressed {
-                            if let Some(bytes) = input::key_to_bytes(event.physical_key, &event.text.as_ref().map(|s| s.as_str()).unwrap_or("")) {
+                            let text = event.text.as_ref().map(|s| s.as_str()).unwrap_or("");
+                            println!(
+                                "Key pressed: physical_key={:?}, text='{}', logical_key={:?}",
+                                event.physical_key, text, event.logical_key
+                            );
+                            if let Some(bytes) =
+                                input::key_to_bytes(event.physical_key, text, &event.logical_key)
+                            {
+                                println!("Sending bytes: {:?}", bytes);
                                 wisp_window.send_input(&bytes);
                             }
                         }
                     }
+                    WindowEvent::Ime(ime) => match ime {
+                        Ime::Commit(text) => {
+                            println!("IME Commit: '{}'", text);
+                            wisp_window.send_input(text.as_bytes());
+                        }
+                        Ime::Preedit(_, _) => {
+                            // Ignore preedit for now
+                        }
+                        Ime::Enabled | Ime::Disabled => {}
+                    },
                     _ => {}
                 }
             }
@@ -51,6 +68,6 @@ fn main() {
                 wisp_window.window().request_redraw();
             }
             _ => {}
-        }
-    }).expect("Event loop error");
+        })
+        .expect("Event loop error");
 }

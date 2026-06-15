@@ -36,23 +36,23 @@ impl Default for ColorPalette {
             // Basic 16 ANSI colors
             ansi: [
                 // Normal colors
-                [0.0, 0.0, 0.0, 1.0],       // Black
-                [0.8, 0.0, 0.0, 1.0],       // Red
-                [0.0, 0.8, 0.0, 1.0],       // Green
-                [0.8, 0.8, 0.0, 1.0],       // Yellow
-                [0.0, 0.0, 0.8, 1.0],       // Blue
-                [0.8, 0.0, 0.8, 1.0],       // Magenta
-                [0.0, 0.8, 0.8, 1.0],       // Cyan
-                [0.8, 0.8, 0.8, 1.0],       // White
+                [0.0, 0.0, 0.0, 1.0], // Black
+                [0.8, 0.0, 0.0, 1.0], // Red
+                [0.0, 0.8, 0.0, 1.0], // Green
+                [0.8, 0.8, 0.0, 1.0], // Yellow
+                [0.0, 0.0, 0.8, 1.0], // Blue
+                [0.8, 0.0, 0.8, 1.0], // Magenta
+                [0.0, 0.8, 0.8, 1.0], // Cyan
+                [0.8, 0.8, 0.8, 1.0], // White
                 // Bright colors
-                [0.4, 0.4, 0.4, 1.0],       // Bright Black
-                [1.0, 0.0, 0.0, 1.0],       // Bright Red
-                [0.0, 1.0, 0.0, 1.0],       // Bright Green
-                [1.0, 1.0, 0.0, 1.0],       // Bright Yellow
-                [0.0, 0.0, 1.0, 1.0],       // Bright Blue
-                [1.0, 0.0, 1.0, 1.0],       // Bright Magenta
-                [0.0, 1.0, 1.0, 1.0],       // Bright Cyan
-                [1.0, 1.0, 1.0, 1.0],       // Bright White
+                [0.4, 0.4, 0.4, 1.0], // Bright Black
+                [1.0, 0.0, 0.0, 1.0], // Bright Red
+                [0.0, 1.0, 0.0, 1.0], // Bright Green
+                [1.0, 1.0, 0.0, 1.0], // Bright Yellow
+                [0.0, 0.0, 1.0, 1.0], // Bright Blue
+                [1.0, 0.0, 1.0, 1.0], // Bright Magenta
+                [0.0, 1.0, 1.0, 1.0], // Bright Cyan
+                [1.0, 1.0, 1.0, 1.0], // Bright White
             ],
         }
     }

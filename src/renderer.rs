@@ -130,6 +130,27 @@ impl Renderer {
             view_formats: &[],
         });
 
+        // Initialize texture with a white pixel at (0,0) for background rendering
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: 0, y: 0, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[255u8], // White pixel
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(1),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+
         let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -215,7 +236,7 @@ impl Renderer {
                 topology: wgpu::PrimitiveTopology::TriangleList,
                 strip_index_format: None,
                 front_face: wgpu::FrontFace::Ccw,
-                cull_mode: Some(wgpu::Face::Back),
+                cull_mode: None,
                 polygon_mode: wgpu::PolygonMode::Fill,
                 unclipped_depth: false,
                 conservative: false,
@@ -273,6 +294,12 @@ impl Renderer {
         // Build vertices for all visible characters
         let vertices = self.build_vertices(terminal);
         let indices = self.build_indices(vertices.len() / 4);
+
+        println!(
+            "Render: vertices={}, indices={}",
+            vertices.len(),
+            indices.len()
+        );
 
         // If there are no vertices to render, just clear the screen and present
         if vertices.is_empty() || indices.is_empty() {
@@ -361,9 +388,66 @@ impl Renderer {
         let width_ndc = 2.0 / self.size.width as f32;
         let height_ndc = 2.0 / self.size.height as f32;
 
+        // Texture coords for solid color (white pixel at 0,0)
+        let bg_u0 = 0.0;
+        let bg_v0 = 0.0;
+        let bg_u1 = 1.0 / 1024.0;
+        let bg_v1 = 1.0 / 1024.0;
+
         for row in 0..terminal.rows() {
             for col in 0..terminal.cols() {
                 if let Some(cell) = terminal.get_cell(col, row) {
+                    let x = col as f32 * cell_width + self.terminal_config.padding;
+                    let y = row as f32 * cell_height + self.terminal_config.padding;
+
+                    // Convert to NDC
+                    let x_ndc = x * width_ndc - 1.0;
+                    let y_ndc = 1.0 - y * height_ndc;
+                    let cell_w_ndc = cell_width * width_ndc;
+                    let cell_h_ndc = cell_height * height_ndc;
+
+                    // Determine colors (handle inverse)
+                    let mut fg = cell.fg;
+                    let mut bg = cell.bg;
+                    if cell.flags.contains(crate::terminal::CellFlags::INVERSE) {
+                        std::mem::swap(&mut fg, &mut bg);
+                    }
+
+                    // Handle bold - use bright colors (8-15) if bold and fg is 0-7
+                    if cell.flags.contains(crate::terminal::CellFlags::BOLD) && fg < 8 {
+                        fg += 8;
+                    }
+
+                    let fg_color = self.color_palette.ansi[fg as usize];
+                    let bg_color = self.color_palette.ansi[bg as usize];
+
+                    // Render background if not default black (or if inverse)
+                    if bg != 0 || cell.flags.contains(crate::terminal::CellFlags::INVERSE) {
+                        // Background quad (using a solid color, no texture)
+                        vertices.extend_from_slice(&[
+                            Vertex {
+                                position: [x_ndc, y_ndc, 0.0],
+                                tex_coords: [bg_u0, bg_v0],
+                                color: bg_color,
+                            },
+                            Vertex {
+                                position: [x_ndc + cell_w_ndc, y_ndc, 0.0],
+                                tex_coords: [bg_u1, bg_v0],
+                                color: bg_color,
+                            },
+                            Vertex {
+                                position: [x_ndc + cell_w_ndc, y_ndc - cell_h_ndc, 0.0],
+                                tex_coords: [bg_u1, bg_v1],
+                                color: bg_color,
+                            },
+                            Vertex {
+                                position: [x_ndc, y_ndc - cell_h_ndc, 0.0],
+                                tex_coords: [bg_u0, bg_v1],
+                                color: bg_color,
+                            },
+                        ]);
+                    }
+
                     if cell.ch == ' ' {
                         continue;
                     }
@@ -375,6 +459,10 @@ impl Renderer {
                     // This is inefficient but works for demonstration
                     let atlas_x = (cell.ch as u32 % 32) * 32;
                     let atlas_y = (cell.ch as u32 / 32) * 32;
+
+                    if glyph.bitmap.is_empty() {
+                        println!("WARNING: Glyph '{}' has empty bitmap!", cell.ch);
+                    }
 
                     if !glyph.bitmap.is_empty() {
                         self.queue.write_texture(
@@ -402,12 +490,6 @@ impl Renderer {
                         );
                     }
 
-                    let x = col as f32 * cell_width + self.terminal_config.padding;
-                    let y = row as f32 * cell_height + self.terminal_config.padding;
-
-                    // Convert to NDC
-                    let x_ndc = x * width_ndc - 1.0;
-                    let y_ndc = 1.0 - y * height_ndc;
                     let w_ndc = glyph.width as f32 * width_ndc;
                     let h_ndc = glyph.height as f32 * height_ndc;
 
@@ -416,32 +498,104 @@ impl Renderer {
                     let u1 = (atlas_x + glyph.width as u32) as f32 / 1024.0;
                     let v1 = (atlas_y + glyph.height as u32) as f32 / 1024.0;
 
-                    let color = self.color_palette.ansi[cell.fg as usize];
-
-                    // Create quad (two triangles)
+                    // Create quad (two triangles) for the glyph
+                    // Position at cell top-left (simple positioning for MVP)
                     vertices.extend_from_slice(&[
                         Vertex {
                             position: [x_ndc, y_ndc, 0.0],
                             tex_coords: [u0, v0],
-                            color,
+                            color: fg_color,
                         },
                         Vertex {
                             position: [x_ndc + w_ndc, y_ndc, 0.0],
                             tex_coords: [u1, v0],
-                            color,
+                            color: fg_color,
                         },
                         Vertex {
                             position: [x_ndc + w_ndc, y_ndc - h_ndc, 0.0],
                             tex_coords: [u1, v1],
-                            color,
+                            color: fg_color,
                         },
                         Vertex {
                             position: [x_ndc, y_ndc - h_ndc, 0.0],
                             tex_coords: [u0, v1],
-                            color,
+                            color: fg_color,
                         },
                     ]);
+
+                    // Render underline if flag is set
+                    if cell.flags.contains(crate::terminal::CellFlags::UNDERLINE) {
+                        let underline_y_ndc = y_ndc - cell_h_ndc + (2.0 * height_ndc);
+                        let underline_h_ndc = 2.0 * height_ndc;
+
+                        vertices.extend_from_slice(&[
+                            Vertex {
+                                position: [x_ndc, underline_y_ndc, 0.0],
+                                tex_coords: [bg_u0, bg_v0],
+                                color: fg_color,
+                            },
+                            Vertex {
+                                position: [x_ndc + cell_w_ndc, underline_y_ndc, 0.0],
+                                tex_coords: [bg_u1, bg_v0],
+                                color: fg_color,
+                            },
+                            Vertex {
+                                position: [
+                                    x_ndc + cell_w_ndc,
+                                    underline_y_ndc - underline_h_ndc,
+                                    0.0,
+                                ],
+                                tex_coords: [bg_u1, bg_v1],
+                                color: fg_color,
+                            },
+                            Vertex {
+                                position: [x_ndc, underline_y_ndc - underline_h_ndc, 0.0],
+                                tex_coords: [bg_u0, bg_v1],
+                                color: fg_color,
+                            },
+                        ]);
+                    }
                 }
+            }
+        }
+
+        // Render cursor
+        if terminal.cursor_visible() {
+            let (cursor_col, cursor_row) = terminal.cursor();
+            if cursor_col < terminal.cols() && cursor_row < terminal.rows() {
+                let x = cursor_col as f32 * cell_width + self.terminal_config.padding;
+                let y = cursor_row as f32 * cell_height + self.terminal_config.padding;
+
+                let x_ndc = x * width_ndc - 1.0;
+                let y_ndc = 1.0 - y * height_ndc;
+                let cell_w_ndc = cell_width * width_ndc;
+                let cell_h_ndc = cell_height * height_ndc;
+
+                let cursor_color = self.color_palette.cursor;
+
+                // Cursor is a solid block
+                vertices.extend_from_slice(&[
+                    Vertex {
+                        position: [x_ndc, y_ndc, 0.0],
+                        tex_coords: [bg_u0, bg_v0],
+                        color: cursor_color,
+                    },
+                    Vertex {
+                        position: [x_ndc + cell_w_ndc, y_ndc, 0.0],
+                        tex_coords: [bg_u1, bg_v0],
+                        color: cursor_color,
+                    },
+                    Vertex {
+                        position: [x_ndc + cell_w_ndc, y_ndc - cell_h_ndc, 0.0],
+                        tex_coords: [bg_u1, bg_v1],
+                        color: cursor_color,
+                    },
+                    Vertex {
+                        position: [x_ndc, y_ndc - cell_h_ndc, 0.0],
+                        tex_coords: [bg_u0, bg_v1],
+                        color: cursor_color,
+                    },
+                ]);
             }
         }
 

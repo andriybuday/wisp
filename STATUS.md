@@ -25,14 +25,14 @@
 - [ ] Text selection with mouse
 - [ ] Copy to clipboard
 - [ ] Paste from clipboard (Cmd+V)
-- [ ] Proper color rendering (SGR codes)
-- [ ] Bold/italic/underline text attributes
-- [ ] PTY resize on window resize
+- [x] Proper color rendering (SGR codes)
+- [x] Bold/italic/underline text attributes
+- [x] PTY resize on window resize
 - [ ] Better error handling
 - [ ] Performance optimization
 
 ### Phase 4: MVP Completion
-- [ ] Cursor rendering (blinking block)
+- [x] Cursor rendering (blinking block)
 - [ ] Scrollback navigation
 - [ ] Basic menu bar
 - [ ] Quit command (Cmd+Q)
@@ -41,10 +41,10 @@
 
 ## Known Issues
 
-1. Colors not fully implemented in SGR parser
-2. Text attributes (bold, italic) not rendered
-3. PTY resize not implemented
-4. No visual cursor
+1. ~~Colors not fully implemented in SGR parser~~ ✅ Fixed
+2. ~~Text attributes (bold, italic) not rendered~~ ✅ Fixed (bold, underline)
+3. ~~PTY resize not implemented~~ ✅ Fixed
+4. ~~No visual cursor~~ ✅ Fixed
 5. No text selection
 6. Some ANSI sequences not handled
 
