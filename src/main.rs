@@ -1,6 +1,7 @@
 use winit::{
     event::{ElementState, Event, Ime, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
+    keyboard::{KeyCode, ModifiersState, PhysicalKey},
 };
 
 mod config;
@@ -22,6 +23,8 @@ fn main() {
 
     event_loop.set_control_flow(ControlFlow::Poll);
 
+    let mut modifiers = ModifiersState::empty();
+
     event_loop
         .run(move |event, elwt| match event {
             Event::WindowEvent { event, window_id } if window_id == wisp_window.window().id() => {
@@ -36,8 +39,20 @@ fn main() {
                     WindowEvent::RedrawRequested => {
                         wisp_window.render();
                     }
+                    WindowEvent::ModifiersChanged(new_modifiers) => {
+                        modifiers = new_modifiers.state();
+                    }
                     WindowEvent::KeyboardInput { event, .. } => {
                         if event.state == ElementState::Pressed {
+                            // Paste: Cmd+V (macOS) or Ctrl+Shift+V (others).
+                            let is_v = event.physical_key == PhysicalKey::Code(KeyCode::KeyV);
+                            let paste_combo = modifiers.super_key()
+                                || (modifiers.control_key() && modifiers.shift_key());
+                            if is_v && paste_combo {
+                                wisp_window.paste();
+                                return;
+                            }
+
                             let text = event.text.as_ref().map(|s| s.as_str()).unwrap_or("");
                             println!(
                                 "Key pressed: physical_key={:?}, text='{}', logical_key={:?}",

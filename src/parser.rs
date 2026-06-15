@@ -56,7 +56,7 @@ impl Perform for AnsiPerformer {
 
     fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {}
 
-    fn csi_dispatch(&mut self, params: &Params, _intermediates: &[u8], _ignore: bool, c: char) {
+    fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, c: char) {
         match c {
             'A' => {
                 // Cursor up
@@ -138,6 +138,18 @@ impl Perform for AnsiPerformer {
                     for param in params.iter() {
                         for &p in param {
                             self.terminal.sgr(p as usize);
+                        }
+                    }
+                }
+            }
+            'h' | 'l' => {
+                // DEC private mode set ('h') / reset ('l'), e.g. `CSI ? 2004 h`.
+                // The private `?` marker is delivered as an intermediate byte.
+                if intermediates.first() == Some(&b'?') {
+                    let enabled = c == 'h';
+                    for param in params.iter() {
+                        if param.first().copied() == Some(2004) {
+                            self.terminal.set_bracketed_paste(enabled);
                         }
                     }
                 }
