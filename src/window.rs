@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use winit::{
-    dpi::PhysicalSize,
+    dpi::{LogicalSize, PhysicalSize},
     event_loop::EventLoop,
     window::{Window, WindowAttributes},
 };
@@ -23,8 +23,10 @@ impl WispWindow {
     pub fn new(event_loop: &EventLoop<()>) -> Self {
         let config = Config::default();
 
-        // Calculate initial window size based on terminal grid
-        // Use FontManager to get actual cell dimensions
+        // Calculate initial window size based on terminal grid.
+        // These are logical (point) dimensions; winit scales them to physical
+        // pixels using the display's scale factor, and the renderer lays out
+        // glyphs in physical pixels to match.
         let mut font_manager = crate::font::FontManager::new(config.font_size);
         let cell_width = font_manager.cell_width() as u32;
         let cell_height = font_manager.cell_height() as u32;
@@ -33,8 +35,8 @@ impl WispWindow {
 
         let window_attrs = WindowAttributes::default()
             .with_title("Wisp Terminal")
-            .with_inner_size(PhysicalSize::new(width, height))
-            .with_min_inner_size(PhysicalSize::new(400, 300));
+            .with_inner_size(LogicalSize::new(width, height))
+            .with_min_inner_size(LogicalSize::new(400, 300));
 
         let window = Arc::new(
             event_loop
@@ -67,12 +69,13 @@ impl WispWindow {
     pub fn resize(&mut self, new_size: PhysicalSize<u32>) {
         self.renderer.resize(new_size);
 
-        // Calculate new grid size
-        // Use same calculations as FontManager
-        let mut font_manager = crate::font::FontManager::new(self.config.font_size);
+        // Calculate new grid size. new_size is in physical pixels, so the cell
+        // metrics and padding must also be in physical pixels (scaled).
+        let scale = self.window.scale_factor() as f32;
+        let mut font_manager = crate::font::FontManager::new(self.config.font_size * scale);
         let cell_width = font_manager.cell_width();
         let cell_height = font_manager.cell_height();
-        let padding = self.config.padding * 2.0;
+        let padding = self.config.padding * scale * 2.0;
 
         let available_width = new_size.width as f32 - padding;
         let available_height = new_size.height as f32 - padding;

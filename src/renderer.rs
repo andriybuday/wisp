@@ -49,15 +49,28 @@ pub struct Renderer {
     pipeline: wgpu::RenderPipeline,
     color_palette: ColorPalette,
     terminal_config: Config,
+    /// Padding in physical pixels (config padding scaled by the display factor)
+    padding: f32,
     font_manager: FontManager,
     texture: wgpu::Texture,
     texture_view: wgpu::TextureView,
     texture_bind_group: wgpu::BindGroup,
+    /// Glyph atlas bookkeeping: size of one square slot, slots per row, and the
+    /// top-left atlas position assigned to each character on first use.
+    atlas_slot: u32,
+    atlas_cols: u32,
+    glyph_positions: std::collections::HashMap<char, (u32, u32)>,
 }
+
+/// Side length of the (square) glyph atlas texture, in texels.
+const ATLAS_SIZE: u32 = 1024;
 
 impl Renderer {
     pub fn new(window: Arc<Window>, terminal_config: &Config) -> Self {
         let size = window.inner_size();
+        // Rasterize and lay out in physical pixels so text is crisp and
+        // correctly sized on HiDPI / Retina displays (scale_factor > 1.0).
+        let scale = window.scale_factor() as f32;
 
         // Create wgpu instance
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -110,7 +123,15 @@ impl Renderer {
 
         surface.configure(&device, &config);
 
-        let mut font_manager = FontManager::new(terminal_config.font_size);
+        let mut font_manager = FontManager::new(terminal_config.font_size * scale);
+
+        // Size each atlas slot to comfortably hold a glyph at the current
+        // (physical) font size, then derive how many slots fit per row. This
+        // keeps every glyph inside the atlas regardless of its character code.
+        let atlas_slot =
+            (font_manager.cell_width().ceil() as u32).max(font_manager.cell_height().ceil() as u32)
+                + 4;
+        let atlas_cols = (ATLAS_SIZE / atlas_slot).max(1);
 
         // Create texture for glyph atlas (simple 1024x1024 for now)
         let texture_size = wgpu::Extent3d {
@@ -260,10 +281,14 @@ impl Renderer {
             pipeline,
             color_palette: ColorPalette::default(),
             terminal_config: terminal_config.clone(),
+            padding: terminal_config.padding * scale,
             font_manager,
             texture,
             texture_view,
             texture_bind_group,
+            atlas_slot,
+            atlas_cols,
+            glyph_positions: std::collections::HashMap::new(),
         }
     }
 
@@ -397,8 +422,8 @@ impl Renderer {
         for row in 0..terminal.rows() {
             for col in 0..terminal.cols() {
                 if let Some(cell) = terminal.get_cell(col, row) {
-                    let x = col as f32 * cell_width + self.terminal_config.padding;
-                    let y = row as f32 * cell_height + self.terminal_config.padding;
+                    let x = col as f32 * cell_width + self.padding;
+                    let y = row as f32 * cell_height + self.padding;
 
                     // Convert to NDC
                     let x_ndc = x * width_ndc - 1.0;
@@ -454,49 +479,63 @@ impl Renderer {
 
                     let glyph = self.font_manager.get_glyph(cell.ch);
 
-                    // Upload glyph to texture atlas at a simple position
-                    // For MVP, we'll just use a fixed position per character
-                    // This is inefficient but works for demonstration
-                    let atlas_x = (cell.ch as u32 % 32) * 32;
-                    let atlas_y = (cell.ch as u32 / 32) * 32;
+                    // Assign this character a fixed atlas slot the first time we
+                    // see it, uploading its bitmap once. Slots are bounded to the
+                    // atlas, so any character code is safe (no overrun panic).
+                    if !self.glyph_positions.contains_key(&cell.ch) {
+                        let rows = ATLAS_SIZE / self.atlas_slot;
+                        let capacity = self.atlas_cols * rows;
+                        if self.glyph_positions.len() as u32 >= capacity {
+                            // Atlas full: recycle slots (rare for typical use).
+                            self.glyph_positions.clear();
+                        }
+                        let idx = self.glyph_positions.len() as u32;
+                        let atlas_x = (idx % self.atlas_cols) * self.atlas_slot;
+                        let atlas_y = (idx / self.atlas_cols) * self.atlas_slot;
+                        self.glyph_positions.insert(cell.ch, (atlas_x, atlas_y));
 
-                    if glyph.bitmap.is_empty() {
-                        println!("WARNING: Glyph '{}' has empty bitmap!", cell.ch);
-                    }
-
-                    if !glyph.bitmap.is_empty() {
-                        self.queue.write_texture(
-                            wgpu::ImageCopyTexture {
-                                texture: &self.texture,
-                                mip_level: 0,
-                                origin: wgpu::Origin3d {
-                                    x: atlas_x,
-                                    y: atlas_y,
-                                    z: 0,
+                        if !glyph.bitmap.is_empty() {
+                            // Clamp to the slot so an oversized glyph can never
+                            // write outside its slot / the atlas.
+                            let gw = (glyph.width as u32).min(self.atlas_slot);
+                            let gh = (glyph.height as u32).min(self.atlas_slot);
+                            self.queue.write_texture(
+                                wgpu::ImageCopyTexture {
+                                    texture: &self.texture,
+                                    mip_level: 0,
+                                    origin: wgpu::Origin3d {
+                                        x: atlas_x,
+                                        y: atlas_y,
+                                        z: 0,
+                                    },
+                                    aspect: wgpu::TextureAspect::All,
                                 },
-                                aspect: wgpu::TextureAspect::All,
-                            },
-                            &glyph.bitmap,
-                            wgpu::ImageDataLayout {
-                                offset: 0,
-                                bytes_per_row: Some(glyph.width as u32),
-                                rows_per_image: Some(glyph.height as u32),
-                            },
-                            wgpu::Extent3d {
-                                width: glyph.width as u32,
-                                height: glyph.height as u32,
-                                depth_or_array_layers: 1,
-                            },
-                        );
+                                &glyph.bitmap,
+                                wgpu::ImageDataLayout {
+                                    offset: 0,
+                                    bytes_per_row: Some(glyph.width as u32),
+                                    rows_per_image: Some(glyph.height as u32),
+                                },
+                                wgpu::Extent3d {
+                                    width: gw,
+                                    height: gh,
+                                    depth_or_array_layers: 1,
+                                },
+                            );
+                        }
                     }
 
-                    let w_ndc = glyph.width as f32 * width_ndc;
-                    let h_ndc = glyph.height as f32 * height_ndc;
+                    let (atlas_x, atlas_y) = self.glyph_positions[&cell.ch];
+                    let gw = (glyph.width as u32).min(self.atlas_slot);
+                    let gh = (glyph.height as u32).min(self.atlas_slot);
 
-                    let u0 = atlas_x as f32 / 1024.0;
-                    let v0 = atlas_y as f32 / 1024.0;
-                    let u1 = (atlas_x + glyph.width as u32) as f32 / 1024.0;
-                    let v1 = (atlas_y + glyph.height as u32) as f32 / 1024.0;
+                    let w_ndc = gw as f32 * width_ndc;
+                    let h_ndc = gh as f32 * height_ndc;
+
+                    let u0 = atlas_x as f32 / ATLAS_SIZE as f32;
+                    let v0 = atlas_y as f32 / ATLAS_SIZE as f32;
+                    let u1 = (atlas_x + gw) as f32 / ATLAS_SIZE as f32;
+                    let v1 = (atlas_y + gh) as f32 / ATLAS_SIZE as f32;
 
                     // Create quad (two triangles) for the glyph
                     // Position at cell top-left (simple positioning for MVP)
@@ -563,8 +602,8 @@ impl Renderer {
         if terminal.cursor_visible() {
             let (cursor_col, cursor_row) = terminal.cursor();
             if cursor_col < terminal.cols() && cursor_row < terminal.rows() {
-                let x = cursor_col as f32 * cell_width + self.terminal_config.padding;
-                let y = cursor_row as f32 * cell_height + self.terminal_config.padding;
+                let x = cursor_col as f32 * cell_width + self.padding;
+                let y = cursor_row as f32 * cell_height + self.padding;
 
                 let x_ndc = x * width_ndc - 1.0;
                 let y_ndc = 1.0 - y * height_ndc;
