@@ -422,7 +422,7 @@ impl Renderer {
 
         for row in 0..terminal.rows() {
             for col in 0..terminal.cols() {
-                if let Some(cell) = terminal.get_cell(col, row) {
+                if let Some(cell) = terminal.get_viewport_cell(col, row) {
                     let x = col as f32 * cell_width + self.padding;
                     let y = row as f32 * cell_height + self.padding;
 
@@ -445,10 +445,17 @@ impl Renderer {
                     }
 
                     let fg_color = self.color_palette.ansi[fg as usize];
-                    let bg_color = self.color_palette.ansi[bg as usize];
+                    let mut bg_color = self.color_palette.ansi[bg as usize];
 
-                    // Render background if not default black (or if inverse)
-                    if bg != 0 || cell.flags.contains(crate::terminal::CellFlags::INVERSE) {
+                    // Check if this cell is selected
+                    let is_selected = terminal.is_cell_selected(col, row);
+                    if is_selected {
+                        // Use a distinct selection color (light blue/gray)
+                        bg_color = [0.3, 0.5, 0.7, 1.0];
+                    }
+
+                    // Render background if not default black (or if inverse or selected)
+                    if bg != 0 || cell.flags.contains(crate::terminal::CellFlags::INVERSE) || is_selected {
                         // Background quad (using a solid color, no texture)
                         vertices.extend_from_slice(&[
                             Vertex {
@@ -609,8 +616,8 @@ impl Renderer {
             }
         }
 
-        // Render cursor
-        if terminal.cursor_visible() {
+        // Render cursor (only if not scrolled)
+        if terminal.cursor_visible() && terminal.scroll_offset() == 0 {
             let (cursor_col, cursor_row) = terminal.cursor();
             if cursor_col < terminal.cols() && cursor_row < terminal.rows() {
                 let x = cursor_col as f32 * cell_width + self.padding;

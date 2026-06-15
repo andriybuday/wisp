@@ -51,6 +51,10 @@ pub struct Terminal {
     cursor_visible: bool,
     /// Bracketed paste mode (DEC private mode 2004) is enabled
     bracketed_paste: bool,
+    /// Text selection range: (start_col, start_row, end_col, end_row)
+    selection: Option<(usize, usize, usize, usize)>,
+    /// Scrollback offset (0 = at bottom, >0 = scrolled up)
+    scroll_offset: usize,
 }
 
 impl Terminal {
@@ -69,6 +73,8 @@ impl Terminal {
             current_flags: CellFlags::empty(),
             cursor_visible: true,
             bracketed_paste: false,
+            selection: None,
+            scroll_offset: 0,
         }
     }
 
@@ -138,6 +144,9 @@ impl Terminal {
     // ANSI control functions
 
     pub fn print(&mut self, ch: char) {
+        // Reset scroll offset when new content arrives
+        self.scroll_offset = 0;
+
         let (col, row) = self.cursor;
         if col < self.cols && row < self.rows {
             self.grid[row * self.cols + col] = Cell {
@@ -298,6 +307,142 @@ impl Terminal {
         // Clear last line
         for col in 0..self.cols {
             self.grid[(self.rows - 1) * self.cols + col] = Cell::default();
+        }
+    }
+
+    // Selection methods
+
+    pub fn set_selection_start(&mut self, col: usize, row: usize) {
+        self.selection = Some((col, row, col, row));
+    }
+
+    pub fn set_selection_end(&mut self, col: usize, row: usize) {
+        if let Some((start_col, start_row, _, _)) = self.selection {
+            self.selection = Some((start_col, start_row, col, row));
+        }
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
+    pub fn selection(&self) -> Option<(usize, usize, usize, usize)> {
+        self.selection
+    }
+
+    pub fn is_cell_selected(&self, col: usize, row: usize) -> bool {
+        if let Some((start_col, start_row, end_col, end_row)) = self.selection {
+            // Normalize the selection (start before end)
+            let (start_col, start_row, end_col, end_row) = if start_row < end_row
+                || (start_row == end_row && start_col <= end_col)
+            {
+                (start_col, start_row, end_col, end_row)
+            } else {
+                (end_col, end_row, start_col, start_row)
+            };
+
+            let cell_pos = row * self.cols + col;
+            let start_pos = start_row * self.cols + start_col;
+            let end_pos = end_row * self.cols + end_col;
+
+            cell_pos >= start_pos && cell_pos <= end_pos
+        } else {
+            false
+        }
+    }
+
+    // Scrollback methods
+
+    pub fn scroll_offset(&self) -> usize {
+        self.scroll_offset
+    }
+
+    pub fn scrollback_len(&self) -> usize {
+        self.scrollback.len()
+    }
+
+    pub fn scroll_viewport_up(&mut self, lines: usize) {
+        let max_scroll = self.scrollback.len();
+        self.scroll_offset = (self.scroll_offset + lines).min(max_scroll);
+    }
+
+    pub fn scroll_viewport_down(&mut self, lines: usize) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(lines);
+    }
+
+    pub fn scroll_to_bottom(&mut self) {
+        self.scroll_offset = 0;
+    }
+
+    /// Get a cell from the visible viewport (accounting for scroll offset)
+    pub fn get_viewport_cell(&self, col: usize, row: usize) -> Option<&Cell> {
+        if col >= self.cols {
+            return None;
+        }
+
+        if self.scroll_offset == 0 {
+            // Normal view - get from main grid
+            self.get_cell(col, row)
+        } else {
+            // Scrolled view - get from scrollback or grid
+            let total_rows = self.scrollback.len() + self.rows;
+            let viewport_start = total_rows.saturating_sub(self.rows + self.scroll_offset);
+            let absolute_row = viewport_start + row;
+
+            if absolute_row < self.scrollback.len() {
+                // Get from scrollback
+                self.scrollback.get(absolute_row).and_then(|line| line.get(col))
+            } else {
+                // Get from main grid
+                let grid_row = absolute_row - self.scrollback.len();
+                self.get_cell(col, grid_row)
+            }
+        }
+    }
+
+    pub fn get_selected_text(&self) -> String {
+        if let Some((start_col, start_row, end_col, end_row)) = self.selection {
+            // Normalize the selection (start before end)
+            let (start_col, start_row, end_col, end_row) = if start_row < end_row
+                || (start_row == end_row && start_col <= end_col)
+            {
+                (start_col, start_row, end_col, end_row)
+            } else {
+                (end_col, end_row, start_col, start_row)
+            };
+
+            let mut text = String::new();
+
+            for row in start_row..=end_row {
+                if row >= self.rows {
+                    break;
+                }
+
+                let line_start = if row == start_row { start_col } else { 0 };
+                let line_end = if row == end_row {
+                    end_col
+                } else {
+                    self.cols - 1
+                };
+
+                for col in line_start..=line_end {
+                    if col >= self.cols {
+                        break;
+                    }
+                    if let Some(cell) = self.get_cell(col, row) {
+                        text.push(cell.ch);
+                    }
+                }
+
+                // Add newline if not on the last row
+                if row < end_row {
+                    text.push('\n');
+                }
+            }
+
+            text
+        } else {
+            String::new()
         }
     }
 }
