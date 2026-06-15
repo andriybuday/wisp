@@ -1,6 +1,6 @@
-use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::keyboard::{Key, KeyCode, PhysicalKey};
 
-pub fn key_to_bytes(key: PhysicalKey, text: &str) -> Option<Vec<u8>> {
+pub fn key_to_bytes(key: PhysicalKey, text: &str, logical_key: &Key) -> Option<Vec<u8>> {
     match key {
         PhysicalKey::Code(code) => match code {
             KeyCode::Enter => Some(b"\r".to_vec()),
@@ -17,8 +17,11 @@ pub fn key_to_bytes(key: PhysicalKey, text: &str) -> Option<Vec<u8>> {
             KeyCode::PageDown => Some(b"\x1b[6~".to_vec()),
             KeyCode::Delete => Some(b"\x1b[3~".to_vec()),
             _ => {
+                // Try text first, then fall back to logical_key character
                 if !text.is_empty() {
                     Some(text.as_bytes().to_vec())
+                } else if let Key::Character(ch) = logical_key {
+                    Some(ch.as_bytes().to_vec())
                 } else {
                     None
                 }
@@ -27,6 +30,8 @@ pub fn key_to_bytes(key: PhysicalKey, text: &str) -> Option<Vec<u8>> {
         _ => {
             if !text.is_empty() {
                 Some(text.as_bytes().to_vec())
+            } else if let Key::Character(ch) = logical_key {
+                Some(ch.as_bytes().to_vec())
             } else {
                 None
             }

@@ -23,18 +23,18 @@ impl FontManager {
         let font_data = include_bytes!("../assets/SourceCodePro-Regular.ttf");
         let font = Font::from_bytes(font_data as &[u8], FontSettings::default())
             .expect("Failed to load font");
-        
+
         Self {
             font,
             font_size,
             glyph_cache: HashMap::new(),
         }
     }
-    
+
     pub fn get_glyph(&mut self, ch: char) -> &Glyph {
         if !self.glyph_cache.contains_key(&ch) {
             let (metrics, bitmap) = self.font.rasterize(ch, self.font_size);
-            
+
             let glyph = Glyph {
                 bitmap,
                 width: metrics.width,
@@ -43,17 +43,17 @@ impl FontManager {
                 offset_x: metrics.xmin,
                 offset_y: metrics.ymin,
             };
-            
+
             self.glyph_cache.insert(ch, glyph);
         }
-        
+
         self.glyph_cache.get(&ch).unwrap()
     }
-    
+
     pub fn cell_width(&mut self) -> f32 {
         self.get_glyph('M').advance
     }
-    
+
     pub fn cell_height(&self) -> f32 {
         self.font_size * 1.3
     }

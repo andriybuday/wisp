@@ -51,9 +51,12 @@ cargo check
 ✅ Keyboard input  
 ✅ ANSI escape sequences  
 ✅ Scrollback buffer  
+✅ Color rendering (16 ANSI colors + bright variants)  
+✅ Text attributes (bold, underline, inverse)  
+✅ Visual cursor  
+✅ PTY resize on window resize  
 ⏳ Text selection (coming soon)  
 ⏳ Copy/paste (coming soon)  
-⏳ Color rendering (coming soon)  
 
 See [STATUS.md](STATUS.md) for detailed progress.
 
