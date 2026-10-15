@@ -4,7 +4,7 @@ use winit::{dpi::PhysicalSize, window::Window};
 
 use crate::config::{ColorPalette, Config};
 use crate::font::FontManager;
-use crate::terminal::Terminal;
+use crate::terminal::{Color, Terminal};
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -428,20 +428,29 @@ impl Renderer {
                     let cell_w_ndc = cell_width * width_ndc;
                     let cell_h_ndc = cell_height * height_ndc;
 
-                    // Determine colors (handle inverse)
+                    // Bold brightens only the base 8 indexed colors.
                     let mut fg = cell.fg;
-                    let mut bg = cell.bg;
+                    if cell.flags.contains(crate::terminal::CellFlags::BOLD) {
+                        if let Color::Indexed(n) = fg {
+                            if n <= 7 {
+                                fg = Color::Indexed(n + 8);
+                            }
+                        }
+                    }
+
+                    // Resolve to RGBA; inverse swaps the resolved colors.
+                    let resolve = |c: Color, default: [f32; 4]| match c {
+                        Color::Default => default,
+                        Color::Indexed(n) => self.color_palette.ansi_256(n),
+                        Color::Rgb(r, g, b) => {
+                            [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0]
+                        }
+                    };
+                    let mut fg_color = resolve(fg, self.color_palette.foreground);
+                    let mut bg_color = resolve(cell.bg, self.color_palette.background);
                     if cell.flags.contains(crate::terminal::CellFlags::INVERSE) {
-                        std::mem::swap(&mut fg, &mut bg);
+                        std::mem::swap(&mut fg_color, &mut bg_color);
                     }
-
-                    // Handle bold - use bright colors (8-15) if bold and fg is 0-7
-                    if cell.flags.contains(crate::terminal::CellFlags::BOLD) && fg < 8 {
-                        fg += 8;
-                    }
-
-                    let fg_color = self.color_palette.ansi[fg as usize];
-                    let mut bg_color = self.color_palette.ansi[bg as usize];
 
                     // Check if this cell is selected
                     let is_selected = terminal.is_cell_selected(col, row);
@@ -450,8 +459,8 @@ impl Renderer {
                         bg_color = [0.3, 0.5, 0.7, 1.0];
                     }
 
-                    // Render background if not default black (or if inverse or selected)
-                    if bg != 0
+                    // Render background if not the default (or if inverse or selected)
+                    if cell.bg != Color::Default
                         || cell.flags.contains(crate::terminal::CellFlags::INVERSE)
                         || is_selected
                     {
