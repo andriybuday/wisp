@@ -44,6 +44,26 @@ cargo run
 cargo check
 ```
 
+### Spec-Driven Development (GitHub Spec Kit)
+
+This project uses [GitHub Spec Kit](https://github.com/github/spec-kit) for
+spec-driven development. The governing principles live in
+[.specify/memory/constitution.md](.specify/memory/constitution.md); feature
+artifacts go under `specs/NNN-<feature>/`.
+
+Prerequisite: the `specify` CLI (`specify check` verifies your setup).
+Spec Kit skills are installed for Claude Code under `.claude/skills/`;
+add another agent later with `specify integration install <agent>`.
+
+Workflow for a new feature, from your coding agent:
+
+1. `/speckit-specify` — create the feature specification
+2. `/speckit-clarify` — (optional) resolve ambiguities before planning
+3. `/speckit-plan` — create the implementation plan
+4. `/speckit-tasks` — generate actionable tasks
+5. `/speckit-analyze` — (optional) check cross-artifact consistency
+6. `/speckit-implement` — execute the implementation
+
 ## Current Features
 
 ✅ Basic window and rendering  
