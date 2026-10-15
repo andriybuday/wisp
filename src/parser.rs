@@ -637,4 +637,36 @@ mod tests {
         let p = run(b"\x1b[9999L\x1b[9999M\x1b[9999@\x1b[9999P\x1b[9999S\x1b[9999T\x1b[9999;9999r\x1b[9999G");
         assert_eq!(p.terminal().cursor().0, 9);
     }
+
+    // Cross-feature checks added by the orchestrator after merging 002-005;
+    // these exercise interactions no single feature branch could cover.
+
+    #[test]
+    fn merged_truecolor_survives_save_restore() {
+        // 003 truecolor flowing through 002 save/restore (ESC 7 / ESC 8).
+        let p = run(b"\x1b[38;2;10;20;30mab\x1b7\x1b[0m\x1b[H\x1b8x");
+        assert_eq!(
+            p.terminal().get_cell(2, 0).unwrap().fg,
+            Color::Rgb(10, 20, 30)
+        );
+    }
+
+    #[test]
+    fn merged_cpr_reports_cursor_on_alt_screen() {
+        // 004 cursor position report while 002 alternate screen is active.
+        let mut p = run(b"\x1b[?1049h\x1b[2;3H\x1b[6n");
+        assert_eq!(p.take_replies(), vec![b"\x1b[2;3R".to_vec()]);
+        // Leaving the alt screen restores the main-screen cursor for CPR.
+        let mut p = run(b"ab\x1b[?1049h\x1b[H\x1b[?1049l\x1b[6n");
+        assert_eq!(p.take_replies(), vec![b"\x1b[1;3R".to_vec()]);
+    }
+
+    #[test]
+    fn merged_256color_inside_scroll_region() {
+        // 003 indexed-256 color printed inside a 002 scroll region.
+        let p = run(b"\x1b[2;3r\x1b[38;5;196mX");
+        // DECSTBM homes the cursor to (0,0); X lands there in color 196.
+        assert_eq!(p.terminal().get_cell(0, 0).unwrap().ch, 'X');
+        assert_eq!(p.terminal().get_cell(0, 0).unwrap().fg, Color::Indexed(196));
+    }
 }
