@@ -22,6 +22,7 @@ pollster = "0.3"
 # Bitflags for cell attributes
 bitflags = "2.6"
 # Logging
+log = "0.4"
 env_logger = "0.11"
 # For vertex data
 bytemuck = { version = "1.14", features = ["derive"] }

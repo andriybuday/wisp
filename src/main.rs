@@ -30,7 +30,7 @@ fn main() {
             Event::WindowEvent { event, window_id } if window_id == wisp_window.window().id() => {
                 match event {
                     WindowEvent::CloseRequested => {
-                        println!("Close requested, exiting...");
+                        log::debug!("Close requested, exiting...");
                         elwt.exit();
                     }
                     WindowEvent::Resized(physical_size) => {
@@ -63,14 +63,16 @@ fn main() {
                             }
 
                             let text = event.text.as_ref().map(|s| s.as_str()).unwrap_or("");
-                            println!(
+                            log::debug!(
                                 "Key pressed: physical_key={:?}, text='{}', logical_key={:?}",
-                                event.physical_key, text, event.logical_key
+                                event.physical_key,
+                                text,
+                                event.logical_key
                             );
                             if let Some(bytes) =
                                 input::key_to_bytes(event.physical_key, text, &event.logical_key)
                             {
-                                println!("Sending bytes: {:?}", bytes);
+                                log::debug!("Sending bytes: {:?}", bytes);
                                 wisp_window.send_input(&bytes);
                             }
                         }
@@ -99,7 +101,7 @@ fn main() {
                     }
                     WindowEvent::Ime(ime) => match ime {
                         Ime::Commit(text) => {
-                            println!("IME Commit: '{}'", text);
+                            log::debug!("IME Commit: '{}'", text);
                             wisp_window.send_input(text.as_bytes());
                         }
                         Ime::Preedit(_, _) => {

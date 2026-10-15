@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use winit::{
-    dpi::{LogicalSize, PhysicalSize, PhysicalPosition},
+    dpi::{LogicalSize, PhysicalPosition, PhysicalSize},
     event_loop::EventLoop,
     window::{Window, WindowAttributes},
 };
@@ -57,7 +57,7 @@ impl WispWindow {
             PtyManager::new(config.cols as u16, config.rows as u16).expect("Failed to create PTY");
 
         let clipboard = arboard::Clipboard::new()
-            .map_err(|e| eprintln!("Clipboard unavailable: {e}"))
+            .map_err(|e| log::warn!("Clipboard unavailable: {e}"))
             .ok();
 
         Self {
@@ -105,7 +105,7 @@ impl WispWindow {
     pub fn render(&mut self) {
         // Read from PTY and process
         while let Some(data) = self.pty.try_read() {
-            println!(
+            log::debug!(
                 "PTY output: {:?} '{}'",
                 data,
                 String::from_utf8_lossy(&data)
@@ -161,7 +161,7 @@ impl WispWindow {
     /// Handle mouse press for selection start
     pub fn mouse_press(&mut self) {
         self.mouse_pressed = true;
-        
+
         // Convert physical position to grid coordinates
         if let Some(position) = self.last_mouse_position {
             if let Some((col, row)) = self.position_to_grid(position) {
@@ -194,7 +194,7 @@ impl WispWindow {
         // Positive delta = scroll up (show older content)
         // Negative delta = scroll down (show newer content)
         let lines = (delta.abs() / 10.0).ceil().max(1.0) as usize;
-        
+
         if delta > 0.0 {
             self.parser.terminal_mut().scroll_viewport_up(lines);
         } else if delta < 0.0 {

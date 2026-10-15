@@ -29,7 +29,7 @@ impl PtyManager {
         cmd.env("TERM", "xterm-256color");
 
         let child = pair.slave.spawn_command(cmd)?;
-        println!("Spawned shell: {} (PID: {:?})", shell, child.process_id());
+        log::debug!("Spawned shell: {} (PID: {:?})", shell, child.process_id());
 
         let mut reader = pair.master.try_clone_reader()?;
         let writer = pair.master.take_writer()?;
@@ -52,7 +52,7 @@ impl PtyManager {
                         break;
                     }
                     Err(e) => {
-                        eprintln!("PTY read error: {}", e);
+                        log::warn!("PTY read error: {}", e);
                         break;
                     }
                 }

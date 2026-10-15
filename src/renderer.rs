@@ -48,12 +48,10 @@ pub struct Renderer {
     size: PhysicalSize<u32>,
     pipeline: wgpu::RenderPipeline,
     color_palette: ColorPalette,
-    terminal_config: Config,
     /// Padding in physical pixels (config padding scaled by the display factor)
     padding: f32,
     font_manager: FontManager,
     texture: wgpu::Texture,
-    texture_view: wgpu::TextureView,
     texture_bind_group: wgpu::BindGroup,
     /// Glyph atlas bookkeeping: size of one square slot, slots per row, and the
     /// top-left atlas position assigned to each character on first use.
@@ -128,9 +126,9 @@ impl Renderer {
         // Size each atlas slot to comfortably hold a glyph at the current
         // (physical) font size, then derive how many slots fit per row. This
         // keeps every glyph inside the atlas regardless of its character code.
-        let atlas_slot =
-            (font_manager.cell_width().ceil() as u32).max(font_manager.cell_height().ceil() as u32)
-                + 4;
+        let atlas_slot = (font_manager.cell_width().ceil() as u32)
+            .max(font_manager.cell_height().ceil() as u32)
+            + 4;
         let atlas_cols = (ATLAS_SIZE / atlas_slot).max(1);
 
         // Create texture for glyph atlas (simple 1024x1024 for now)
@@ -280,11 +278,9 @@ impl Renderer {
             size,
             pipeline,
             color_palette: ColorPalette::default(),
-            terminal_config: terminal_config.clone(),
             padding: terminal_config.padding * scale,
             font_manager,
             texture,
-            texture_view,
             texture_bind_group,
             atlas_slot,
             atlas_cols,
@@ -320,7 +316,7 @@ impl Renderer {
         let vertices = self.build_vertices(terminal);
         let indices = self.build_indices(vertices.len() / 4);
 
-        println!(
+        log::debug!(
             "Render: vertices={}, indices={}",
             vertices.len(),
             indices.len()
@@ -455,7 +451,10 @@ impl Renderer {
                     }
 
                     // Render background if not default black (or if inverse or selected)
-                    if bg != 0 || cell.flags.contains(crate::terminal::CellFlags::INVERSE) || is_selected {
+                    if bg != 0
+                        || cell.flags.contains(crate::terminal::CellFlags::INVERSE)
+                        || is_selected
+                    {
                         // Background quad (using a solid color, no texture)
                         vertices.extend_from_slice(&[
                             Vertex {

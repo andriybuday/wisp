@@ -102,6 +102,8 @@ impl Terminal {
         self.cursor_visible
     }
 
+    // Kept for upcoming Spec Kit features.
+    #[allow(dead_code)]
     pub fn set_cursor_visible(&mut self, visible: bool) {
         self.cursor_visible = visible;
     }
@@ -135,6 +137,8 @@ impl Terminal {
         Some(&self.grid[row * self.cols + col])
     }
 
+    // Kept for upcoming Spec Kit features.
+    #[allow(dead_code)]
     pub fn set_cell(&mut self, col: usize, row: usize, cell: Cell) {
         if col < self.cols && row < self.rows {
             self.grid[row * self.cols + col] = cell;
@@ -322,10 +326,14 @@ impl Terminal {
         }
     }
 
+    // Kept for upcoming Spec Kit features.
+    #[allow(dead_code)]
     pub fn clear_selection(&mut self) {
         self.selection = None;
     }
 
+    // Kept for upcoming Spec Kit features.
+    #[allow(dead_code)]
     pub fn selection(&self) -> Option<(usize, usize, usize, usize)> {
         self.selection
     }
@@ -333,13 +341,12 @@ impl Terminal {
     pub fn is_cell_selected(&self, col: usize, row: usize) -> bool {
         if let Some((start_col, start_row, end_col, end_row)) = self.selection {
             // Normalize the selection (start before end)
-            let (start_col, start_row, end_col, end_row) = if start_row < end_row
-                || (start_row == end_row && start_col <= end_col)
-            {
-                (start_col, start_row, end_col, end_row)
-            } else {
-                (end_col, end_row, start_col, start_row)
-            };
+            let (start_col, start_row, end_col, end_row) =
+                if start_row < end_row || (start_row == end_row && start_col <= end_col) {
+                    (start_col, start_row, end_col, end_row)
+                } else {
+                    (end_col, end_row, start_col, start_row)
+                };
 
             let cell_pos = row * self.cols + col;
             let start_pos = start_row * self.cols + start_col;
@@ -357,6 +364,8 @@ impl Terminal {
         self.scroll_offset
     }
 
+    // Kept for upcoming Spec Kit features.
+    #[allow(dead_code)]
     pub fn scrollback_len(&self) -> usize {
         self.scrollback.len()
     }
@@ -370,6 +379,8 @@ impl Terminal {
         self.scroll_offset = self.scroll_offset.saturating_sub(lines);
     }
 
+    // Kept for upcoming Spec Kit features.
+    #[allow(dead_code)]
     pub fn scroll_to_bottom(&mut self) {
         self.scroll_offset = 0;
     }
@@ -391,7 +402,9 @@ impl Terminal {
 
             if absolute_row < self.scrollback.len() {
                 // Get from scrollback
-                self.scrollback.get(absolute_row).and_then(|line| line.get(col))
+                self.scrollback
+                    .get(absolute_row)
+                    .and_then(|line| line.get(col))
             } else {
                 // Get from main grid
                 let grid_row = absolute_row - self.scrollback.len();
@@ -403,13 +416,12 @@ impl Terminal {
     pub fn get_selected_text(&self) -> String {
         if let Some((start_col, start_row, end_col, end_row)) = self.selection {
             // Normalize the selection (start before end)
-            let (start_col, start_row, end_col, end_row) = if start_row < end_row
-                || (start_row == end_row && start_col <= end_col)
-            {
-                (start_col, start_row, end_col, end_row)
-            } else {
-                (end_col, end_row, start_col, start_row)
-            };
+            let (start_col, start_row, end_col, end_row) =
+                if start_row < end_row || (start_row == end_row && start_col <= end_col) {
+                    (start_col, start_row, end_col, end_row)
+                } else {
+                    (end_col, end_row, start_col, start_row)
+                };
 
             let mut text = String::new();
 
@@ -444,5 +456,248 @@ impl Terminal {
         } else {
             String::new()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn term(cols: usize, rows: usize) -> Terminal {
+        Terminal::new(cols, rows)
+    }
+
+    fn print_str(t: &mut Terminal, s: &str) {
+        for ch in s.chars() {
+            t.print(ch);
+        }
+    }
+
+    #[test]
+    fn print_writes_char_and_advances_cursor() {
+        let mut t = term(10, 3);
+        t.print('a');
+        assert_eq!(t.get_cell(0, 0).unwrap().ch, 'a');
+        assert_eq!(t.cursor(), (1, 0));
+    }
+
+    #[test]
+    fn print_uses_default_colors() {
+        let mut t = term(10, 3);
+        t.print('x');
+        let cell = t.get_cell(0, 0).unwrap();
+        assert_eq!((cell.fg, cell.bg), (7, 0));
+        assert!(cell.flags.is_empty());
+    }
+
+    #[test]
+    fn print_wraps_at_last_column() {
+        let mut t = term(3, 3);
+        print_str(&mut t, "abcd");
+        assert_eq!(t.get_cell(2, 0).unwrap().ch, 'c');
+        assert_eq!(t.get_cell(0, 1).unwrap().ch, 'd');
+        assert_eq!(t.cursor(), (1, 1));
+    }
+
+    #[test]
+    fn linefeed_at_bottom_scrolls_up() {
+        let mut t = term(5, 2);
+        print_str(&mut t, "ab");
+        t.linefeed();
+        print_str(&mut t, "cd");
+        t.linefeed();
+        assert_eq!(t.get_cell(0, 0).unwrap().ch, 'c');
+        assert_eq!(t.get_cell(0, 1).unwrap().ch, ' ');
+        assert_eq!(t.cursor(), (0, 1));
+        assert_eq!(t.scrollback.len(), 1);
+        assert_eq!(t.scrollback[0][0].ch, 'a');
+    }
+
+    #[test]
+    fn scrollback_respects_limit() {
+        let mut t = term(2, 2);
+        t.scrollback_limit = 2;
+        for ch in ['a', 'b', 'c', 'd', 'e'] {
+            t.print(ch);
+            t.linefeed();
+        }
+        assert_eq!(t.scrollback.len(), 2);
+    }
+
+    #[test]
+    fn cursor_moves_clamp_to_grid() {
+        let mut t = term(5, 3);
+        t.cursor_down(10);
+        t.cursor_forward(10);
+        assert_eq!(t.cursor(), (4, 2));
+        t.cursor_up(1);
+        t.cursor_backward(2);
+        assert_eq!(t.cursor(), (2, 1));
+        t.cursor_up(99);
+        t.cursor_backward(99);
+        assert_eq!(t.cursor(), (0, 0));
+    }
+
+    #[test]
+    fn cursor_goto_clamps() {
+        let mut t = term(5, 3);
+        t.cursor_goto(3, 2);
+        assert_eq!(t.cursor(), (3, 2));
+        t.cursor_goto(99, 99);
+        assert_eq!(t.cursor(), (4, 2));
+    }
+
+    #[test]
+    fn carriage_return_and_backspace() {
+        let mut t = term(10, 2);
+        print_str(&mut t, "abc");
+        t.carriage_return();
+        assert_eq!(t.cursor(), (0, 0));
+        t.backspace();
+        assert_eq!(t.cursor(), (0, 0));
+        t.cursor_forward(2);
+        t.backspace();
+        assert_eq!(t.cursor(), (1, 0));
+    }
+
+    #[test]
+    fn tab_advances_to_next_multiple_of_8() {
+        let mut t = term(20, 2);
+        t.tab();
+        assert_eq!(t.cursor(), (8, 0));
+        t.print('x');
+        t.tab();
+        assert_eq!(t.cursor(), (16, 0));
+    }
+
+    #[test]
+    fn tab_beyond_last_column_wraps() {
+        let mut t = term(10, 3);
+        t.cursor_forward(9);
+        t.tab();
+        assert_eq!(t.cursor(), (0, 1));
+    }
+
+    #[test]
+    fn clear_all_keeps_cursor() {
+        let mut t = term(5, 2);
+        print_str(&mut t, "hi");
+        t.clear_all();
+        assert_eq!(t.get_cell(0, 0).unwrap().ch, ' ');
+        assert_eq!(t.cursor(), (2, 0));
+    }
+
+    #[test]
+    fn clear_below_and_above() {
+        let mut t = term(4, 3);
+        print_str(&mut t, "abcd");
+        print_str(&mut t, "efgh");
+        t.cursor_goto(1, 0);
+        t.clear_below();
+        assert_eq!(t.get_cell(0, 0).unwrap().ch, 'a');
+        assert_eq!(t.get_cell(1, 0).unwrap().ch, ' ');
+        assert_eq!(t.get_cell(0, 1).unwrap().ch, ' ');
+        let mut t = term(4, 3);
+        print_str(&mut t, "abcd");
+        print_str(&mut t, "efgh");
+        t.cursor_goto(1, 1);
+        t.clear_above();
+        assert_eq!(t.get_cell(0, 0).unwrap().ch, ' ');
+        assert_eq!(t.get_cell(1, 1).unwrap().ch, ' ');
+        assert_eq!(t.get_cell(2, 1).unwrap().ch, 'g');
+    }
+
+    #[test]
+    fn clear_line_variants() {
+        let mut t = term(4, 2);
+        print_str(&mut t, "abcd");
+        t.cursor_goto(2, 0);
+        t.clear_line_right();
+        assert_eq!(t.get_cell(1, 0).unwrap().ch, 'b');
+        assert_eq!(t.get_cell(2, 0).unwrap().ch, ' ');
+        t.clear_line_left();
+        assert_eq!(t.get_cell(0, 0).unwrap().ch, ' ');
+        let mut t = term(4, 2);
+        print_str(&mut t, "abcd");
+        t.cursor_goto(1, 0);
+        t.clear_line();
+        assert_eq!(t.get_cell(0, 0).unwrap().ch, ' ');
+        assert_eq!(t.get_cell(3, 0).unwrap().ch, ' ');
+    }
+
+    #[test]
+    fn sgr_normal_and_bright_colors() {
+        let mut t = term(10, 2);
+        t.sgr(31);
+        t.sgr(42);
+        t.print('a');
+        assert_eq!(
+            (t.get_cell(0, 0).unwrap().fg, t.get_cell(0, 0).unwrap().bg),
+            (1, 2)
+        );
+        t.sgr(91);
+        t.sgr(103);
+        t.print('b');
+        assert_eq!(
+            (t.get_cell(1, 0).unwrap().fg, t.get_cell(1, 0).unwrap().bg),
+            (9, 11)
+        );
+    }
+
+    #[test]
+    fn sgr_bold_underline_inverse_and_removals() {
+        let mut t = term(10, 2);
+        t.sgr(1);
+        t.sgr(4);
+        t.sgr(7);
+        t.print('a');
+        let f = t.get_cell(0, 0).unwrap().flags;
+        assert!(f.contains(CellFlags::BOLD | CellFlags::UNDERLINE | CellFlags::INVERSE));
+        t.sgr(22);
+        t.sgr(24);
+        t.sgr(27);
+        t.print('b');
+        assert!(t.get_cell(1, 0).unwrap().flags.is_empty());
+    }
+
+    #[test]
+    fn sgr_reset_and_defaults() {
+        let mut t = term(10, 2);
+        t.sgr(31);
+        t.sgr(1);
+        t.sgr(0);
+        t.print('a');
+        let cell = t.get_cell(0, 0).unwrap();
+        assert_eq!((cell.fg, cell.bg), (7, 0));
+        assert!(cell.flags.is_empty());
+        t.sgr(34);
+        t.sgr(45);
+        t.sgr(39);
+        t.sgr(49);
+        t.print('b');
+        assert_eq!(
+            (t.get_cell(1, 0).unwrap().fg, t.get_cell(1, 0).unwrap().bg),
+            (7, 0)
+        );
+    }
+
+    #[test]
+    fn selection_text_single_and_multi_row() {
+        let mut t = term(4, 3);
+        print_str(&mut t, "abcd");
+        print_str(&mut t, "efgh");
+        t.set_selection_start(1, 0);
+        t.set_selection_end(2, 0);
+        assert_eq!(t.get_selected_text(), "bc");
+        t.set_selection_start(3, 1);
+        t.set_selection_end(2, 0);
+        assert_eq!(t.get_selected_text(), "cd\nefgh");
+    }
+
+    #[test]
+    fn empty_selection_text_is_empty() {
+        let t = term(4, 2);
+        assert_eq!(t.get_selected_text(), "");
+        assert!(!t.is_cell_selected(0, 0));
     }
 }

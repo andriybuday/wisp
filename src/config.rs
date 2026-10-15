@@ -22,6 +22,8 @@ impl Default for Config {
 #[derive(Debug, Clone, Copy)]
 pub struct ColorPalette {
     pub background: [f32; 4],
+    // Kept for upcoming Spec Kit features.
+    #[allow(dead_code)]
     pub foreground: [f32; 4],
     pub cursor: [f32; 4],
     pub ansi: [[f32; 4]; 16],
