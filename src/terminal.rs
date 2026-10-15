@@ -1,9 +1,18 @@
+/// A terminal color: the palette default, a 256-color palette index,
+/// or a 24-bit truecolor value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Color {
+    Default,
+    Indexed(u8),
+    Rgb(u8, u8, u8),
+}
+
 /// Represents a single cell in the terminal grid
 #[derive(Debug, Clone, Copy)]
 pub struct Cell {
     pub ch: char,
-    pub fg: u8, // Foreground color index (0-15)
-    pub bg: u8, // Background color index (0-15)
+    pub fg: Color,
+    pub bg: Color,
     pub flags: CellFlags,
 }
 
@@ -11,8 +20,8 @@ impl Default for Cell {
     fn default() -> Self {
         Self {
             ch: ' ',
-            fg: 7, // Default white
-            bg: 0, // Default black
+            fg: Color::Default,
+            bg: Color::Default,
             flags: CellFlags::empty(),
         }
     }
@@ -42,9 +51,9 @@ pub struct Terminal {
     scrollback: Vec<Vec<Cell>>,
     scrollback_limit: usize,
     /// Current foreground color
-    current_fg: u8,
+    current_fg: Color,
     /// Current background color
-    current_bg: u8,
+    current_bg: Color,
     /// Current text flags
     current_flags: CellFlags,
     /// Cursor visible
@@ -70,8 +79,8 @@ impl Terminal {
             cursor: (0, 0),
             scrollback: Vec::new(),
             scrollback_limit: 1000,
-            current_fg: 7, // Default white
-            current_bg: 0, // Default black
+            current_fg: Color::Default,
+            current_bg: Color::Default,
             current_flags: CellFlags::empty(),
             cursor_visible: true,
             bracketed_paste: false,
@@ -277,29 +286,37 @@ impl Terminal {
 
     pub fn reset_sgr(&mut self) {
         // Reset to default colors and flags
-        self.current_fg = 7; // Default white
-        self.current_bg = 0; // Default black
+        self.current_fg = Color::Default;
+        self.current_bg = Color::Default;
         self.current_flags = CellFlags::empty();
+    }
+
+    pub fn set_fg_color(&mut self, color: Color) {
+        self.current_fg = color;
+    }
+
+    pub fn set_bg_color(&mut self, color: Color) {
+        self.current_bg = color;
     }
 
     pub fn sgr(&mut self, param: usize) {
         // Handle SGR parameters (colors, bold, etc.)
         match param {
-            0 => self.reset_sgr(),                                  // Reset all
-            1 => self.current_flags.insert(CellFlags::BOLD),        // Bold
-            3 => self.current_flags.insert(CellFlags::ITALIC),      // Italic
-            4 => self.current_flags.insert(CellFlags::UNDERLINE),   // Underline
-            7 => self.current_flags.insert(CellFlags::INVERSE),     // Inverse
-            22 => self.current_flags.remove(CellFlags::BOLD),       // Normal intensity
-            23 => self.current_flags.remove(CellFlags::ITALIC),     // Not italic
-            24 => self.current_flags.remove(CellFlags::UNDERLINE),  // Not underline
-            27 => self.current_flags.remove(CellFlags::INVERSE),    // Not inverse
-            30..=37 => self.current_fg = (param - 30) as u8,        // Foreground colors 0-7
-            40..=47 => self.current_bg = (param - 40) as u8,        // Background colors 0-7
-            90..=97 => self.current_fg = (param - 90 + 8) as u8,    // Bright foreground 8-15
-            100..=107 => self.current_bg = (param - 100 + 8) as u8, // Bright background 8-15
-            39 => self.current_fg = 7,                              // Default foreground
-            49 => self.current_bg = 0,                              // Default background
+            0 => self.reset_sgr(),                                           // Reset all
+            1 => self.current_flags.insert(CellFlags::BOLD),                 // Bold
+            3 => self.current_flags.insert(CellFlags::ITALIC),               // Italic
+            4 => self.current_flags.insert(CellFlags::UNDERLINE),            // Underline
+            7 => self.current_flags.insert(CellFlags::INVERSE),              // Inverse
+            22 => self.current_flags.remove(CellFlags::BOLD),                // Normal intensity
+            23 => self.current_flags.remove(CellFlags::ITALIC),              // Not italic
+            24 => self.current_flags.remove(CellFlags::UNDERLINE),           // Not underline
+            27 => self.current_flags.remove(CellFlags::INVERSE),             // Not inverse
+            30..=37 => self.current_fg = Color::Indexed((param - 30) as u8), // FG 0-7
+            40..=47 => self.current_bg = Color::Indexed((param - 40) as u8), // BG 0-7
+            90..=97 => self.current_fg = Color::Indexed((param - 90 + 8) as u8), // FG 8-15
+            100..=107 => self.current_bg = Color::Indexed((param - 100 + 8) as u8), // BG 8-15
+            39 => self.current_fg = Color::Default,                          // Default FG
+            49 => self.current_bg = Color::Default,                          // Default BG
             _ => {}
         }
     }
@@ -497,7 +514,7 @@ mod tests {
         let mut t = term(10, 3);
         t.print('x');
         let cell = t.get_cell(0, 0).unwrap();
-        assert_eq!((cell.fg, cell.bg), (7, 0));
+        assert_eq!((cell.fg, cell.bg), (Color::Default, Color::Default));
         assert!(cell.flags.is_empty());
     }
 
@@ -644,14 +661,14 @@ mod tests {
         t.print('a');
         assert_eq!(
             (t.get_cell(0, 0).unwrap().fg, t.get_cell(0, 0).unwrap().bg),
-            (1, 2)
+            (Color::Indexed(1), Color::Indexed(2))
         );
         t.sgr(91);
         t.sgr(103);
         t.print('b');
         assert_eq!(
             (t.get_cell(1, 0).unwrap().fg, t.get_cell(1, 0).unwrap().bg),
-            (9, 11)
+            (Color::Indexed(9), Color::Indexed(11))
         );
     }
 
@@ -679,7 +696,7 @@ mod tests {
         t.sgr(0);
         t.print('a');
         let cell = t.get_cell(0, 0).unwrap();
-        assert_eq!((cell.fg, cell.bg), (7, 0));
+        assert_eq!((cell.fg, cell.bg), (Color::Default, Color::Default));
         assert!(cell.flags.is_empty());
         t.sgr(34);
         t.sgr(45);
@@ -688,8 +705,23 @@ mod tests {
         t.print('b');
         assert_eq!(
             (t.get_cell(1, 0).unwrap().fg, t.get_cell(1, 0).unwrap().bg),
-            (7, 0)
+            (Color::Default, Color::Default)
         );
+    }
+
+    #[test]
+    fn extended_colors_via_setters_and_reset() {
+        let mut t = term(10, 2);
+        t.set_fg_color(Color::Indexed(196));
+        t.set_bg_color(Color::Rgb(10, 20, 30));
+        t.print('a');
+        let cell = t.get_cell(0, 0).unwrap();
+        assert_eq!(cell.fg, Color::Indexed(196));
+        assert_eq!(cell.bg, Color::Rgb(10, 20, 30));
+        t.sgr(0);
+        t.print('b');
+        let cell = t.get_cell(1, 0).unwrap();
+        assert_eq!((cell.fg, cell.bg), (Color::Default, Color::Default));
     }
 
     #[test]

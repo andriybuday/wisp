@@ -43,6 +43,85 @@ struct AnsiPerformer {
     replies: Vec<Vec<u8>>,
 }
 
+impl AnsiPerformer {
+    /// Stateful SGR walk: simple codes go to `Terminal::sgr`, while extended
+    /// colors (38/48) consume their operands in either semicolon form
+    /// (separate params) or colon form (subparams in one param slice).
+    /// Truncated or malformed extended sequences leave the color unchanged.
+    fn sgr_dispatch(&mut self, params: &Params) {
+        use crate::terminal::Color;
+        let slices: Vec<&[u16]> = params.iter().collect();
+        let clamp = |v: u16| v.min(255) as u8;
+        let mut i = 0;
+        while i < slices.len() {
+            let slice = slices[i];
+            let Some(&code) = slice.first() else {
+                i += 1;
+                continue;
+            };
+            if code != 38 && code != 48 {
+                self.terminal.sgr(code as usize);
+                i += 1;
+                continue;
+            }
+            // Extended color: 38 = foreground, 48 = background.
+            let apply = |t: &mut Terminal, color: Color| {
+                if code == 38 {
+                    t.set_fg_color(color);
+                } else {
+                    t.set_bg_color(color);
+                }
+            };
+            if slice.len() > 1 {
+                // Colon form: mode and operands are subparams of this slice.
+                match slice[1] {
+                    5 => {
+                        if let Some(&n) = slice.get(2) {
+                            apply(&mut self.terminal, Color::Indexed(clamp(n)));
+                        }
+                    }
+                    2 => {
+                        let rest = &slice[2..];
+                        // Skip the optional (often empty) colorspace id.
+                        let rgb = if rest.len() > 3 { &rest[1..] } else { rest };
+                        if rgb.len() >= 3 {
+                            apply(
+                                &mut self.terminal,
+                                Color::Rgb(clamp(rgb[0]), clamp(rgb[1]), clamp(rgb[2])),
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            } else {
+                // Semicolon form: mode and operands are following params.
+                let next = |k: usize| slices.get(k).and_then(|s| s.first().copied());
+                match next(i + 1) {
+                    Some(5) => {
+                        if let Some(n) = next(i + 2) {
+                            apply(&mut self.terminal, Color::Indexed(clamp(n)));
+                            i += 3;
+                        } else {
+                            i += 2; // consume "38;5", color unchanged
+                        }
+                    }
+                    Some(2) => {
+                        if let (Some(r), Some(g), Some(b)) = (next(i + 2), next(i + 3), next(i + 4))
+                        {
+                            apply(&mut self.terminal, Color::Rgb(clamp(r), clamp(g), clamp(b)));
+                            i += 5;
+                        } else {
+                            i = slices.len(); // truncated: consume the rest
+                        }
+                    }
+                    _ => i += 1,
+                }
+            }
+        }
+    }
+}
+
 impl Perform for AnsiPerformer {
     fn print(&mut self, c: char) {
         self.terminal.print(c);
@@ -157,11 +236,7 @@ impl Perform for AnsiPerformer {
                 if params.is_empty() {
                     self.terminal.reset_sgr();
                 } else {
-                    for param in params.iter() {
-                        for &p in param {
-                            self.terminal.sgr(p as usize);
-                        }
-                    }
+                    self.sgr_dispatch(params);
                 }
             }
             // DEC private mode set ('h') / reset ('l'), e.g. `CSI ? 2004 h`.
@@ -232,7 +307,7 @@ impl Perform for AnsiPerformer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::terminal::CellFlags;
+    use crate::terminal::{CellFlags, Color};
 
     fn run(data: &[u8]) -> AnsiParser {
         let mut p = AnsiParser::new(Terminal::new(10, 4));
@@ -300,11 +375,66 @@ mod tests {
     fn csi_m_sgr_and_bare_reset() {
         let p = run(b"\x1b[1;31ma\x1b[mb");
         let a = p.terminal().get_cell(0, 0).unwrap();
-        assert_eq!(a.fg, 1);
+        assert_eq!(a.fg, Color::Indexed(1));
         assert!(a.flags.contains(CellFlags::BOLD));
         let b = p.terminal().get_cell(1, 0).unwrap();
-        assert_eq!(b.fg, 7);
+        assert_eq!(b.fg, Color::Default);
         assert!(b.flags.is_empty());
+    }
+
+    #[test]
+    fn csi_m_256_color_semicolon() {
+        let p = run(b"\x1b[38;5;196ma\x1b[48;5;34mb");
+        let a = p.terminal().get_cell(0, 0).unwrap();
+        assert_eq!((a.fg, a.bg), (Color::Indexed(196), Color::Default));
+        let b = p.terminal().get_cell(1, 0).unwrap();
+        assert_eq!((b.fg, b.bg), (Color::Indexed(196), Color::Indexed(34)));
+    }
+
+    #[test]
+    fn csi_m_256_color_colon() {
+        let p = run(b"\x1b[38:5:196ma\x1b[48:5:34mb");
+        let a = p.terminal().get_cell(0, 0).unwrap();
+        assert_eq!((a.fg, a.bg), (Color::Indexed(196), Color::Default));
+        let b = p.terminal().get_cell(1, 0).unwrap();
+        assert_eq!((b.fg, b.bg), (Color::Indexed(196), Color::Indexed(34)));
+    }
+
+    #[test]
+    fn csi_m_truecolor_fg_and_bg() {
+        let p = run(b"\x1b[38;2;10;20;30ma\x1b[48;2;200;100;50mb");
+        let a = p.terminal().get_cell(0, 0).unwrap();
+        assert_eq!((a.fg, a.bg), (Color::Rgb(10, 20, 30), Color::Default));
+        let b = p.terminal().get_cell(1, 0).unwrap();
+        assert_eq!(
+            (b.fg, b.bg),
+            (Color::Rgb(10, 20, 30), Color::Rgb(200, 100, 50))
+        );
+        // Colon form, with and without the empty colorspace field.
+        let p = run(b"\x1b[38:2::1:2:3ma\x1b[48:2:4:5:6mb");
+        assert_eq!(p.terminal().get_cell(0, 0).unwrap().fg, Color::Rgb(1, 2, 3));
+        assert_eq!(p.terminal().get_cell(1, 0).unwrap().bg, Color::Rgb(4, 5, 6));
+    }
+
+    #[test]
+    fn csi_m_mixed_simple_and_extended() {
+        let p = run(b"\x1b[1;38;5;200ma\x1b[39mb");
+        let a = p.terminal().get_cell(0, 0).unwrap();
+        assert_eq!(a.fg, Color::Indexed(200));
+        assert!(a.flags.contains(CellFlags::BOLD));
+        assert_eq!(p.terminal().get_cell(1, 0).unwrap().fg, Color::Default);
+    }
+
+    #[test]
+    fn csi_m_malformed_extended_leaves_color_unchanged() {
+        // Truncated 256-color and truecolor sequences: no panic, fg stays red.
+        let p = run(b"\x1b[31ma\x1b[38;5mb\x1b[38;2;1mc");
+        assert_eq!(p.terminal().get_cell(1, 0).unwrap().fg, Color::Indexed(1));
+        assert_eq!(p.terminal().get_cell(2, 0).unwrap().fg, Color::Indexed(1));
+        // Truncated colon forms behave the same way.
+        let p = run(b"\x1b[31ma\x1b[38:5mb\x1b[38:2:1mc");
+        assert_eq!(p.terminal().get_cell(1, 0).unwrap().fg, Color::Indexed(1));
+        assert_eq!(p.terminal().get_cell(2, 0).unwrap().fg, Color::Indexed(1));
     }
 
     #[test]
