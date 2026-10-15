@@ -69,9 +69,12 @@ fn main() {
                                 text,
                                 event.logical_key
                             );
-                            if let Some(bytes) =
-                                input::key_to_bytes(event.physical_key, text, &event.logical_key)
-                            {
+                            if let Some(bytes) = input::key_to_bytes(
+                                event.physical_key,
+                                text,
+                                &event.logical_key,
+                                modifiers,
+                            ) {
                                 log::debug!("Sending bytes: {:?}", bytes);
                                 wisp_window.send_input(&bytes);
                             }
