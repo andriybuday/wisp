@@ -122,6 +122,22 @@ impl AnsiPerformer {
     }
 }
 
+fn param_at(params: &Params, idx: usize) -> usize {
+    params
+        .iter()
+        .nth(idx)
+        .and_then(|p| p.first().copied())
+        .unwrap_or(0) as usize
+}
+
+/// Count-style param: missing or 0 means 1 (xterm semantics).
+fn count_param(params: &Params) -> usize {
+    match param_at(params, 0) {
+        0 => 1,
+        n => n,
+    }
+}
+
 impl Perform for AnsiPerformer {
     fn print(&mut self, c: char) {
         self.terminal.print(c);
@@ -239,13 +255,41 @@ impl Perform for AnsiPerformer {
                     self.sgr_dispatch(params);
                 }
             }
+            'G' => {
+                let col = count_param(params);
+                self.terminal.cursor_to_column(col.saturating_sub(1));
+            }
+            'd' => {
+                let row = count_param(params);
+                self.terminal.cursor_to_row(row.saturating_sub(1));
+            }
+            'E' => self.terminal.cursor_next_line(count_param(params)),
+            'F' => self.terminal.cursor_prev_line(count_param(params)),
+            '@' => self.terminal.insert_chars(count_param(params)),
+            'P' => self.terminal.delete_chars(count_param(params)),
+            'X' => self.terminal.erase_chars(count_param(params)),
+            'L' => self.terminal.insert_lines(count_param(params)),
+            'M' => self.terminal.delete_lines(count_param(params)),
+            'S' => self.terminal.csi_scroll_up(count_param(params)),
+            'T' => self.terminal.csi_scroll_down(count_param(params)),
+            'r' => {
+                self.terminal
+                    .set_scroll_region(param_at(params, 0), param_at(params, 1));
+            }
+            's' if intermediates.is_empty() => self.terminal.save_cursor(),
+            'u' if intermediates.is_empty() => self.terminal.restore_cursor(),
             // DEC private mode set ('h') / reset ('l'), e.g. `CSI ? 2004 h`.
             // The private `?` marker is delivered as an intermediate byte.
             'h' | 'l' if intermediates.first() == Some(&b'?') => {
                 let enabled = c == 'h';
                 for param in params.iter() {
-                    if param.first().copied() == Some(2004) {
-                        self.terminal.set_bracketed_paste(enabled);
+                    match param.first().copied() {
+                        Some(25) => self.terminal.set_cursor_visible(enabled),
+                        Some(47) => self.terminal.set_alt_screen_47(enabled),
+                        Some(1047) => self.terminal.set_alt_screen_1047(enabled),
+                        Some(1049) => self.terminal.set_alt_screen_1049(enabled),
+                        Some(2004) => self.terminal.set_bracketed_paste(enabled),
+                        _ => {}
                     }
                 }
             }
@@ -301,7 +345,19 @@ impl Perform for AnsiPerformer {
         }
     }
 
-    fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, _byte: u8) {}
+    fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
+        if !intermediates.is_empty() {
+            return;
+        }
+        match byte {
+            b'D' => self.terminal.index(),
+            b'M' => self.terminal.reverse_index(),
+            b'E' => self.terminal.next_line(),
+            b'7' => self.terminal.save_cursor(),
+            b'8' => self.terminal.restore_cursor(),
+            _ => {}
+        }
+    }
 }
 
 #[cfg(test)]
@@ -500,5 +556,85 @@ mod tests {
         let p = run(b"\x1b]2;\xff\xfe title\x07");
         assert!(p.terminal().title().is_some());
         assert!(p.terminal().title().unwrap().contains("title"));
+    }
+
+    #[test]
+    fn alt_screen_1049_round_trip() {
+        let p = run(b"main\x1b[?1049h\x1b[Hab\x1b[?1049l");
+        assert_eq!(p.terminal().get_cell(0, 0).unwrap().ch, 'm');
+        assert_eq!(p.terminal().cursor(), (4, 0));
+        let p = run(b"\x1b[?1049hab");
+        assert!(p.terminal().on_alternate_screen());
+        assert_eq!(p.terminal().get_cell(0, 0).unwrap().ch, 'a');
+    }
+
+    #[test]
+    fn cursor_visibility_mode_25() {
+        let p = run(b"\x1b[?25l");
+        assert!(!p.terminal().cursor_visible());
+        let p = run(b"\x1b[?25l\x1b[?25h");
+        assert!(p.terminal().cursor_visible());
+    }
+
+    #[test]
+    fn decstbm_via_csi_r() {
+        let p = run(b"\x1b[2;3r");
+        assert_eq!(p.terminal().scroll_region(), (1, 2));
+        let p = run(b"\x1b[r");
+        assert_eq!(p.terminal().scroll_region(), (0, 3));
+    }
+
+    #[test]
+    fn csi_insert_delete_ops() {
+        let p = run(b"abcd\x1b[1;2H\x1b[2@");
+        assert_eq!(p.terminal().get_cell(3, 0).unwrap().ch, 'b');
+        let p = run(b"abcd\x1b[1;1H\x1b[1P");
+        assert_eq!(p.terminal().get_cell(0, 0).unwrap().ch, 'b');
+        let p = run(b"abcd\x1b[1;2H\x1b[2X");
+        assert_eq!(p.terminal().get_cell(1, 0).unwrap().ch, ' ');
+        assert_eq!(p.terminal().get_cell(3, 0).unwrap().ch, 'd');
+        let p = run(b"ab\r\ncd\x1b[1;1H\x1b[1L");
+        assert_eq!(p.terminal().get_cell(0, 1).unwrap().ch, 'a');
+        let p = run(b"ab\r\ncd\x1b[1;1H\x1b[1M");
+        assert_eq!(p.terminal().get_cell(0, 0).unwrap().ch, 'c');
+        let p = run(b"ab\r\ncd\x1b[1S");
+        assert_eq!(p.terminal().get_cell(0, 0).unwrap().ch, 'c');
+        let p = run(b"ab\r\ncd\x1b[1T");
+        assert_eq!(p.terminal().get_cell(0, 1).unwrap().ch, 'a');
+    }
+
+    #[test]
+    fn csi_cha_vpa_cnl_cpl() {
+        let p = run(b"\x1b[5G\x1b[3d");
+        assert_eq!(p.terminal().cursor(), (4, 2));
+        let p = run(b"ab\x1b[2E");
+        assert_eq!(p.terminal().cursor(), (0, 2));
+        let p = run(b"ab\x1b[2E\x1b[1F");
+        assert_eq!(p.terminal().cursor(), (0, 1));
+    }
+
+    #[test]
+    fn esc_index_reverse_next_line() {
+        let p = run(b"a\x1bDb");
+        assert_eq!(p.terminal().get_cell(1, 1).unwrap().ch, 'b');
+        let p = run(b"a\x1bD\x1bMb");
+        assert_eq!(p.terminal().get_cell(1, 0).unwrap().ch, 'b');
+        let p = run(b"ab\x1bEc");
+        assert_eq!(p.terminal().get_cell(0, 1).unwrap().ch, 'c');
+    }
+
+    #[test]
+    fn save_restore_cursor_esc_and_csi() {
+        let p = run(b"\x1b[31mab\x1b7\x1b[0m\x1b[H\x1b8x");
+        assert_eq!(p.terminal().cursor(), (3, 0));
+        assert_eq!(p.terminal().get_cell(2, 0).unwrap().fg, Color::Indexed(1));
+        let p = run(b"ab\x1b[s\x1b[H\x1b[ux");
+        assert_eq!(p.terminal().get_cell(2, 0).unwrap().ch, 'x');
+    }
+
+    #[test]
+    fn oversized_counts_do_not_panic() {
+        let p = run(b"\x1b[9999L\x1b[9999M\x1b[9999@\x1b[9999P\x1b[9999S\x1b[9999T\x1b[9999;9999r\x1b[9999G");
+        assert_eq!(p.terminal().cursor().0, 9);
     }
 }

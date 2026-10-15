@@ -66,11 +66,24 @@ pub struct Terminal {
     selection: Option<(usize, usize, usize, usize)>,
     /// Scrollback offset (0 = at bottom, >0 = scrolled up)
     scroll_offset: usize,
+    /// Alternate screen grid (full-screen apps)
+    alt_grid: Vec<Cell>,
+    /// Whether the alternate screen is active
+    on_alt: bool,
+    /// Scroll region top row (0-based, inclusive)
+    region_top: usize,
+    /// Scroll region bottom row (0-based, inclusive)
+    region_bottom: usize,
+    /// Saved cursor: (col, row, fg, bg, flags) for ESC 7 / CSI s
+    saved_cursor: (usize, usize, Color, Color, CellFlags),
+    /// Cursor saved on entering the alternate screen via ?1049
+    alt_entry_cursor: (usize, usize),
 }
 
 impl Terminal {
     pub fn new(cols: usize, rows: usize) -> Self {
         let grid = vec![Cell::default(); cols * rows];
+        let alt_grid = vec![Cell::default(); cols * rows];
 
         Self {
             grid,
@@ -87,7 +100,115 @@ impl Terminal {
             title: None,
             selection: None,
             scroll_offset: 0,
+            alt_grid,
+            on_alt: false,
+            region_top: 0,
+            region_bottom: rows.saturating_sub(1),
+            saved_cursor: (0, 0, Color::Default, Color::Default, CellFlags::empty()),
+            alt_entry_cursor: (0, 0),
         }
+    }
+
+    fn active_grid(&self) -> &Vec<Cell> {
+        if self.on_alt {
+            &self.alt_grid
+        } else {
+            &self.grid
+        }
+    }
+
+    fn active_grid_mut(&mut self) -> &mut Vec<Cell> {
+        if self.on_alt {
+            &mut self.alt_grid
+        } else {
+            &mut self.grid
+        }
+    }
+
+    // Used by tests; renderer adoption comes later.
+    #[allow(dead_code)]
+    pub fn on_alternate_screen(&self) -> bool {
+        self.on_alt
+    }
+
+    /// DECSET/DECRST ?1049: enter saves cursor, switches and clears alt;
+    /// exit switches back and restores cursor.
+    pub fn set_alt_screen_1049(&mut self, enabled: bool) {
+        if enabled {
+            if !self.on_alt {
+                self.alt_entry_cursor = self.cursor;
+                self.on_alt = true;
+                for cell in &mut self.alt_grid {
+                    *cell = Cell::default();
+                }
+            }
+        } else if self.on_alt {
+            self.on_alt = false;
+            self.cursor = (
+                self.alt_entry_cursor.0.min(self.cols.saturating_sub(1)),
+                self.alt_entry_cursor.1.min(self.rows.saturating_sub(1)),
+            );
+        }
+    }
+
+    /// DECSET/DECRST ?47: switch buffers, no cursor save, no clear.
+    pub fn set_alt_screen_47(&mut self, enabled: bool) {
+        self.on_alt = enabled;
+    }
+
+    /// DECSET/DECRST ?1047: switch buffers, no cursor save; entering does
+    /// not clear, leaving clears the alternate grid.
+    pub fn set_alt_screen_1047(&mut self, enabled: bool) {
+        if enabled {
+            self.on_alt = true;
+        } else {
+            for cell in &mut self.alt_grid {
+                *cell = Cell::default();
+            }
+            self.on_alt = false;
+        }
+    }
+
+    /// DECSTBM scroll region (0-based, inclusive).
+    #[allow(dead_code)]
+    pub fn scroll_region(&self) -> (usize, usize) {
+        (self.region_top, self.region_bottom)
+    }
+
+    /// Set scroll region from 1-based CSI params (0 = default).
+    /// Invalid params select the full screen. Cursor moves to 0,0.
+    pub fn set_scroll_region(&mut self, top: usize, bottom: usize) {
+        let t = if top == 0 { 1 } else { top };
+        let b = if bottom == 0 { self.rows } else { bottom };
+        if t < 1 || b > self.rows || t >= b {
+            self.region_top = 0;
+            self.region_bottom = self.rows.saturating_sub(1);
+        } else {
+            self.region_top = t - 1;
+            self.region_bottom = b - 1;
+        }
+        self.cursor = (0, 0);
+    }
+
+    pub fn save_cursor(&mut self) {
+        self.saved_cursor = (
+            self.cursor.0,
+            self.cursor.1,
+            self.current_fg,
+            self.current_bg,
+            self.current_flags,
+        );
+    }
+
+    pub fn restore_cursor(&mut self) {
+        let (col, row, fg, bg, flags) = self.saved_cursor;
+        self.cursor = (
+            col.min(self.cols.saturating_sub(1)),
+            row.min(self.rows.saturating_sub(1)),
+        );
+        self.current_fg = fg;
+        self.current_bg = bg;
+        self.current_flags = flags;
     }
 
     pub fn cols(&self) -> usize {
@@ -122,46 +243,57 @@ impl Terminal {
         self.cursor_visible
     }
 
-    // Kept for upcoming Spec Kit features.
-    #[allow(dead_code)]
     pub fn set_cursor_visible(&mut self, visible: bool) {
         self.cursor_visible = visible;
     }
 
     pub fn resize(&mut self, new_cols: usize, new_rows: usize) {
-        let mut new_grid = vec![Cell::default(); new_cols * new_rows];
-
-        // Copy existing content
-        let copy_cols = self.cols.min(new_cols);
-        let copy_rows = self.rows.min(new_rows);
-
-        for row in 0..copy_rows {
-            for col in 0..copy_cols {
-                new_grid[row * new_cols + col] = self.grid[row * self.cols + col];
+        fn resized(
+            old: &[Cell],
+            old_cols: usize,
+            old_rows: usize,
+            new_cols: usize,
+            new_rows: usize,
+        ) -> Vec<Cell> {
+            let mut new_grid = vec![Cell::default(); new_cols * new_rows];
+            let copy_cols = old_cols.min(new_cols);
+            let copy_rows = old_rows.min(new_rows);
+            for row in 0..copy_rows {
+                for col in 0..copy_cols {
+                    new_grid[row * new_cols + col] = old[row * old_cols + col];
+                }
             }
+            new_grid
         }
 
-        self.grid = new_grid;
+        self.grid = resized(&self.grid, self.cols, self.rows, new_cols, new_rows);
+        self.alt_grid = resized(&self.alt_grid, self.cols, self.rows, new_cols, new_rows);
         self.cols = new_cols;
         self.rows = new_rows;
 
         // Adjust cursor position
         self.cursor.0 = self.cursor.0.min(new_cols.saturating_sub(1));
         self.cursor.1 = self.cursor.1.min(new_rows.saturating_sub(1));
+
+        // Clamp the scroll region to the new height
+        let last = new_rows.saturating_sub(1);
+        self.region_bottom = self.region_bottom.min(last);
+        self.region_top = self.region_top.min(self.region_bottom);
     }
 
     pub fn get_cell(&self, col: usize, row: usize) -> Option<&Cell> {
         if col >= self.cols || row >= self.rows {
             return None;
         }
-        Some(&self.grid[row * self.cols + col])
+        Some(&self.active_grid()[row * self.cols + col])
     }
 
     // Kept for upcoming Spec Kit features.
     #[allow(dead_code)]
     pub fn set_cell(&mut self, col: usize, row: usize, cell: Cell) {
         if col < self.cols && row < self.rows {
-            self.grid[row * self.cols + col] = cell;
+            let cols = self.cols;
+            self.active_grid_mut()[row * cols + col] = cell;
         }
     }
 
@@ -173,12 +305,14 @@ impl Terminal {
 
         let (col, row) = self.cursor;
         if col < self.cols && row < self.rows {
-            self.grid[row * self.cols + col] = Cell {
+            let cell = Cell {
                 ch,
                 fg: self.current_fg,
                 bg: self.current_bg,
                 flags: self.current_flags,
             };
+            let cols = self.cols;
+            self.active_grid_mut()[row * cols + col] = cell;
             self.cursor.0 += 1;
             if self.cursor.0 >= self.cols {
                 self.linefeed();
@@ -186,12 +320,32 @@ impl Terminal {
         }
     }
 
-    pub fn linefeed(&mut self) {
-        self.cursor.1 += 1;
-        if self.cursor.1 >= self.rows {
-            self.scroll_up();
-            self.cursor.1 = self.rows - 1;
+    /// ESC D (IND): move down, scrolling the region at the bottom margin.
+    pub fn index(&mut self) {
+        if self.cursor.1 == self.region_bottom {
+            self.scroll_region_up(1);
+        } else if self.cursor.1 < self.rows.saturating_sub(1) {
+            self.cursor.1 += 1;
         }
+    }
+
+    /// ESC M (RI): move up, scrolling the region at the top margin.
+    pub fn reverse_index(&mut self) {
+        if self.cursor.1 == self.region_top {
+            self.scroll_region_down(1);
+        } else {
+            self.cursor.1 = self.cursor.1.saturating_sub(1);
+        }
+    }
+
+    /// ESC E (NEL): carriage return + index.
+    pub fn next_line(&mut self) {
+        self.cursor.0 = 0;
+        self.index();
+    }
+
+    pub fn linefeed(&mut self) {
+        self.index();
         self.cursor.0 = 0;
     }
 
@@ -229,58 +383,91 @@ impl Terminal {
     }
 
     pub fn cursor_goto(&mut self, col: usize, row: usize) {
-        self.cursor.0 = col.min(self.cols - 1);
-        self.cursor.1 = row.min(self.rows - 1);
+        self.cursor.0 = col.min(self.cols.saturating_sub(1));
+        self.cursor.1 = row.min(self.rows.saturating_sub(1));
+    }
+
+    /// CSI G (CHA): move to absolute column (0-based).
+    pub fn cursor_to_column(&mut self, col: usize) {
+        self.cursor.0 = col.min(self.cols.saturating_sub(1));
+    }
+
+    /// CSI d (VPA): move to absolute row (0-based).
+    pub fn cursor_to_row(&mut self, row: usize) {
+        self.cursor.1 = row.min(self.rows.saturating_sub(1));
+    }
+
+    /// CSI E (CNL): down n lines, column 0.
+    pub fn cursor_next_line(&mut self, n: usize) {
+        self.cursor_down(n);
+        self.cursor.0 = 0;
+    }
+
+    /// CSI F (CPL): up n lines, column 0.
+    pub fn cursor_prev_line(&mut self, n: usize) {
+        self.cursor_up(n);
+        self.cursor.0 = 0;
     }
 
     pub fn clear_all(&mut self) {
-        for cell in &mut self.grid {
+        for cell in self.active_grid_mut().iter_mut() {
             *cell = Cell::default();
         }
     }
 
     pub fn clear_below(&mut self) {
         let (col, row) = self.cursor;
-        for c in col..self.cols {
-            self.grid[row * self.cols + c] = Cell::default();
+        let cols = self.cols;
+        let rows = self.rows;
+        let grid = self.active_grid_mut();
+        for c in col..cols {
+            grid[row * cols + c] = Cell::default();
         }
-        for r in (row + 1)..self.rows {
-            for c in 0..self.cols {
-                self.grid[r * self.cols + c] = Cell::default();
+        for r in (row + 1)..rows {
+            for c in 0..cols {
+                grid[r * cols + c] = Cell::default();
             }
         }
     }
 
     pub fn clear_above(&mut self) {
         let (col, row) = self.cursor;
+        let cols = self.cols;
+        let grid = self.active_grid_mut();
         for r in 0..row {
-            for c in 0..self.cols {
-                self.grid[r * self.cols + c] = Cell::default();
+            for c in 0..cols {
+                grid[r * cols + c] = Cell::default();
             }
         }
-        for c in 0..=col {
-            self.grid[row * self.cols + c] = Cell::default();
+        for c in 0..=col.min(cols.saturating_sub(1)) {
+            grid[row * cols + c] = Cell::default();
         }
     }
 
     pub fn clear_line(&mut self) {
         let row = self.cursor.1;
-        for c in 0..self.cols {
-            self.grid[row * self.cols + c] = Cell::default();
+        let cols = self.cols;
+        let grid = self.active_grid_mut();
+        for c in 0..cols {
+            grid[row * cols + c] = Cell::default();
         }
     }
 
     pub fn clear_line_right(&mut self) {
         let (col, row) = self.cursor;
-        for c in col..self.cols {
-            self.grid[row * self.cols + c] = Cell::default();
+        let cols = self.cols;
+        let grid = self.active_grid_mut();
+        for c in col..cols {
+            grid[row * cols + c] = Cell::default();
         }
     }
 
     pub fn clear_line_left(&mut self) {
         let (col, row) = self.cursor;
-        for c in 0..=col {
-            self.grid[row * self.cols + c] = Cell::default();
+        let cols = self.cols;
+        let grid = self.active_grid_mut();
+        for c in 0..=col.min(cols.saturating_sub(1)) {
+            grid[row * cols + c] = Cell::default();
         }
     }
 
@@ -321,24 +508,177 @@ impl Terminal {
         }
     }
 
-    fn scroll_up(&mut self) {
-        // Save first line to scrollback
-        let first_line: Vec<Cell> = self.grid[0..self.cols].to_vec();
-        self.scrollback.push(first_line);
-        if self.scrollback.len() > self.scrollback_limit {
-            self.scrollback.remove(0);
-        }
+    fn region_height(&self) -> usize {
+        self.region_bottom
+            .saturating_sub(self.region_top)
+            .saturating_add(1)
+    }
 
-        // Shift all lines up
-        for row in 1..self.rows {
-            for col in 0..self.cols {
-                self.grid[(row - 1) * self.cols + col] = self.grid[row * self.cols + col];
+    /// Scroll the region up by n lines. Lines only enter scrollback when
+    /// scrolling the full-height region on the main screen.
+    fn scroll_region_up(&mut self, n: usize) {
+        let n = n.min(self.region_height());
+        if n == 0 || self.cols == 0 || self.rows == 0 {
+            return;
+        }
+        let full_height = self.region_top == 0 && self.region_bottom == self.rows.saturating_sub(1);
+        if full_height && !self.on_alt {
+            for i in 0..n {
+                let top = self.region_top + i;
+                let line: Vec<Cell> = self.grid[top * self.cols..(top + 1) * self.cols].to_vec();
+                self.scrollback.push(line);
+                if self.scrollback.len() > self.scrollback_limit {
+                    self.scrollback.remove(0);
+                }
             }
         }
+        let (top, bottom, cols) = (self.region_top, self.region_bottom, self.cols);
+        let grid = self.active_grid_mut();
+        if n < bottom + 1 - top {
+            for row in top..=(bottom - n) {
+                for col in 0..cols {
+                    grid[row * cols + col] = grid[(row + n) * cols + col];
+                }
+            }
+        }
+        for row in (bottom + 1 - n)..=bottom {
+            for col in 0..cols {
+                grid[row * cols + col] = Cell::default();
+            }
+        }
+    }
 
-        // Clear last line
-        for col in 0..self.cols {
-            self.grid[(self.rows - 1) * self.cols + col] = Cell::default();
+    /// Scroll the region down by n lines (never touches scrollback).
+    fn scroll_region_down(&mut self, n: usize) {
+        let n = n.min(self.region_height());
+        if n == 0 || self.cols == 0 || self.rows == 0 {
+            return;
+        }
+        let (top, bottom, cols) = (self.region_top, self.region_bottom, self.cols);
+        let grid = self.active_grid_mut();
+        for row in ((top + n)..=bottom).rev() {
+            for col in 0..cols {
+                grid[row * cols + col] = grid[(row - n) * cols + col];
+            }
+        }
+        for row in top..(top + n) {
+            for col in 0..cols {
+                grid[row * cols + col] = Cell::default();
+            }
+        }
+    }
+
+    /// CSI S (SU): scroll the region up n lines.
+    pub fn csi_scroll_up(&mut self, n: usize) {
+        self.scroll_region_up(n);
+    }
+
+    /// CSI T (SD): scroll the region down n lines.
+    pub fn csi_scroll_down(&mut self, n: usize) {
+        self.scroll_region_down(n);
+    }
+
+    /// CSI L (IL): insert n blank lines at the cursor row (region-aware).
+    pub fn insert_lines(&mut self, n: usize) {
+        let row = self.cursor.1;
+        if row < self.region_top || row > self.region_bottom {
+            return;
+        }
+        let n = n.min(self.region_bottom + 1 - row);
+        if n == 0 {
+            return;
+        }
+        let (bottom, cols) = (self.region_bottom, self.cols);
+        let grid = self.active_grid_mut();
+        for r in ((row + n)..=bottom).rev() {
+            for col in 0..cols {
+                grid[r * cols + col] = grid[(r - n) * cols + col];
+            }
+        }
+        for r in row..(row + n) {
+            for col in 0..cols {
+                grid[r * cols + col] = Cell::default();
+            }
+        }
+    }
+
+    /// CSI M (DL): delete n lines at the cursor row (region-aware).
+    pub fn delete_lines(&mut self, n: usize) {
+        let row = self.cursor.1;
+        if row < self.region_top || row > self.region_bottom {
+            return;
+        }
+        let n = n.min(self.region_bottom + 1 - row);
+        if n == 0 {
+            return;
+        }
+        let (bottom, cols) = (self.region_bottom, self.cols);
+        let grid = self.active_grid_mut();
+        if n < bottom + 1 - row {
+            for r in row..=(bottom - n) {
+                for col in 0..cols {
+                    grid[r * cols + col] = grid[(r + n) * cols + col];
+                }
+            }
+        }
+        for r in (bottom + 1 - n)..=bottom {
+            for col in 0..cols {
+                grid[r * cols + col] = Cell::default();
+            }
+        }
+    }
+
+    /// CSI @ (ICH): insert n blank chars at the cursor, shifting right.
+    pub fn insert_chars(&mut self, n: usize) {
+        let (col, row) = self.cursor;
+        if col >= self.cols || row >= self.rows {
+            return;
+        }
+        let n = n.min(self.cols - col);
+        if n == 0 {
+            return;
+        }
+        let cols = self.cols;
+        let grid = self.active_grid_mut();
+        for c in ((col + n)..cols).rev() {
+            grid[row * cols + c] = grid[row * cols + c - n];
+        }
+        for c in col..(col + n) {
+            grid[row * cols + c] = Cell::default();
+        }
+    }
+
+    /// CSI P (DCH): delete n chars at the cursor, shifting left.
+    pub fn delete_chars(&mut self, n: usize) {
+        let (col, row) = self.cursor;
+        if col >= self.cols || row >= self.rows {
+            return;
+        }
+        let n = n.min(self.cols - col);
+        if n == 0 {
+            return;
+        }
+        let cols = self.cols;
+        let grid = self.active_grid_mut();
+        for c in col..(cols - n) {
+            grid[row * cols + c] = grid[row * cols + c + n];
+        }
+        for c in (cols - n)..cols {
+            grid[row * cols + c] = Cell::default();
+        }
+    }
+
+    /// CSI X (ECH): erase n chars starting at the cursor.
+    pub fn erase_chars(&mut self, n: usize) {
+        let (col, row) = self.cursor;
+        if col >= self.cols || row >= self.rows {
+            return;
+        }
+        let end = (col + n).min(self.cols);
+        let cols = self.cols;
+        let grid = self.active_grid_mut();
+        for c in col..end {
+            grid[row * cols + c] = Cell::default();
         }
     }
 
@@ -419,7 +759,7 @@ impl Terminal {
             return None;
         }
 
-        if self.scroll_offset == 0 {
+        if self.on_alt || self.scroll_offset == 0 {
             // Normal view - get from main grid
             self.get_cell(col, row)
         } else {
@@ -742,5 +1082,238 @@ mod tests {
         let t = term(4, 2);
         assert_eq!(t.get_selected_text(), "");
         assert!(!t.is_cell_selected(0, 0));
+    }
+    #[test]
+    fn alt_screen_1049_saves_and_restores_cursor_and_grid() {
+        let mut t = term(5, 3);
+        print_str(&mut t, "hi");
+        t.set_alt_screen_1049(true);
+        assert!(t.on_alternate_screen());
+        assert_eq!(t.get_cell(0, 0).unwrap().ch, ' ');
+        t.cursor_goto(0, 0);
+        print_str(&mut t, "ALT");
+        assert_eq!(t.get_cell(0, 0).unwrap().ch, 'A');
+        t.set_alt_screen_1049(false);
+        assert!(!t.on_alternate_screen());
+        assert_eq!(t.get_cell(0, 0).unwrap().ch, 'h');
+        assert_eq!(t.cursor(), (2, 0));
+    }
+
+    #[test]
+    fn alt_screen_1049_reentry_clears() {
+        let mut t = term(5, 2);
+        t.set_alt_screen_47(true);
+        print_str(&mut t, "zz");
+        t.set_alt_screen_47(false);
+        t.set_alt_screen_1049(true);
+        assert_eq!(t.get_cell(0, 0).unwrap().ch, ' ');
+    }
+
+    #[test]
+    fn alt_screen_47_preserves_both_grids_no_cursor_save() {
+        let mut t = term(5, 2);
+        print_str(&mut t, "ab");
+        t.set_alt_screen_47(true);
+        print_str(&mut t, "XY");
+        assert_eq!(t.get_cell(2, 0).unwrap().ch, 'X');
+        t.set_alt_screen_47(false);
+        assert_eq!(t.get_cell(0, 0).unwrap().ch, 'a');
+        assert_eq!(t.cursor(), (4, 0));
+        t.set_alt_screen_47(true);
+        assert_eq!(t.get_cell(2, 0).unwrap().ch, 'X');
+    }
+
+    #[test]
+    fn alt_screen_1047_exit_clears_alt() {
+        let mut t = term(5, 2);
+        t.set_alt_screen_1047(true);
+        print_str(&mut t, "zz");
+        t.set_alt_screen_1047(false);
+        t.set_alt_screen_1047(true);
+        assert_eq!(t.get_cell(0, 0).unwrap().ch, ' ');
+    }
+
+    #[test]
+    fn alt_screen_scroll_does_not_push_scrollback() {
+        let mut t = term(3, 2);
+        t.set_alt_screen_1049(true);
+        for _ in 0..5 {
+            t.print('x');
+            t.linefeed();
+        }
+        assert_eq!(t.scrollback.len(), 0);
+    }
+
+    #[test]
+    fn alt_viewport_ignores_scroll_offset() {
+        let mut t = term(3, 2);
+        print_str(&mut t, "ab");
+        t.linefeed();
+        print_str(&mut t, "cd");
+        t.linefeed();
+        assert_eq!(t.scrollback.len(), 1);
+        t.scroll_viewport_up(1);
+        assert_eq!(t.get_viewport_cell(0, 0).unwrap().ch, 'a');
+        t.set_alt_screen_47(true);
+        assert_eq!(t.get_viewport_cell(0, 0).unwrap().ch, ' ');
+    }
+
+    #[test]
+    fn scroll_region_linefeed_scrolls_only_region() {
+        let mut t = term(3, 5);
+        for r in 0..5 {
+            t.cursor_goto(0, r);
+            t.print((b'a' + r as u8) as char);
+        }
+        t.set_scroll_region(2, 4);
+        assert_eq!(t.scroll_region(), (1, 3));
+        assert_eq!(t.cursor(), (0, 0));
+        t.cursor_goto(0, 3);
+        t.linefeed();
+        assert_eq!(t.get_cell(0, 0).unwrap().ch, 'a');
+        assert_eq!(t.get_cell(0, 1).unwrap().ch, 'c');
+        assert_eq!(t.get_cell(0, 3).unwrap().ch, ' ');
+        assert_eq!(t.get_cell(0, 4).unwrap().ch, 'e');
+        assert_eq!(t.scrollback.len(), 0);
+        assert_eq!(t.cursor(), (0, 3));
+    }
+
+    #[test]
+    fn scroll_region_invalid_means_full_screen() {
+        let mut t = term(3, 5);
+        t.set_scroll_region(2, 4);
+        t.set_scroll_region(4, 2);
+        assert_eq!(t.scroll_region(), (0, 4));
+        t.set_scroll_region(0, 99);
+        assert_eq!(t.scroll_region(), (0, 4));
+        t.set_scroll_region(0, 0);
+        assert_eq!(t.scroll_region(), (0, 4));
+    }
+
+    #[test]
+    fn linefeed_below_region_clamps_without_scroll() {
+        let mut t = term(3, 4);
+        t.set_scroll_region(1, 2);
+        t.cursor_goto(0, 3);
+        t.print('z');
+        t.cursor_goto(0, 3);
+        t.linefeed();
+        assert_eq!(t.cursor(), (0, 3));
+        assert_eq!(t.get_cell(0, 3).unwrap().ch, 'z');
+        assert_eq!(t.scrollback.len(), 0);
+    }
+
+    #[test]
+    fn index_and_reverse_index_region_aware() {
+        let mut t = term(3, 4);
+        for r in 0..4 {
+            t.cursor_goto(0, r);
+            t.print((b'a' + r as u8) as char);
+        }
+        t.set_scroll_region(2, 3);
+        t.cursor_goto(2, 1);
+        t.reverse_index();
+        assert_eq!(t.cursor(), (2, 1));
+        assert_eq!(t.get_cell(0, 1).unwrap().ch, ' ');
+        assert_eq!(t.get_cell(0, 2).unwrap().ch, 'b');
+        t.cursor_goto(1, 2);
+        t.index();
+        assert_eq!(t.cursor(), (1, 2));
+        assert_eq!(t.get_cell(0, 0).unwrap().ch, 'a');
+        assert_eq!(t.get_cell(0, 3).unwrap().ch, 'd');
+    }
+
+    #[test]
+    fn next_line_does_cr_and_index() {
+        let mut t = term(5, 3);
+        t.cursor_goto(3, 0);
+        t.next_line();
+        assert_eq!(t.cursor(), (0, 1));
+    }
+
+    #[test]
+    fn insert_and_delete_lines_region_aware() {
+        let mut t = term(3, 4);
+        for r in 0..4 {
+            t.cursor_goto(0, r);
+            t.print((b'a' + r as u8) as char);
+        }
+        t.set_scroll_region(1, 3);
+        t.cursor_goto(0, 0);
+        t.insert_lines(1);
+        assert_eq!(t.get_cell(0, 0).unwrap().ch, ' ');
+        assert_eq!(t.get_cell(0, 1).unwrap().ch, 'a');
+        assert_eq!(t.get_cell(0, 3).unwrap().ch, 'd');
+        t.delete_lines(1);
+        assert_eq!(t.get_cell(0, 0).unwrap().ch, 'a');
+        t.cursor_goto(0, 3);
+        t.insert_lines(1);
+        assert_eq!(t.get_cell(0, 3).unwrap().ch, 'd');
+    }
+
+    #[test]
+    fn insert_delete_erase_chars() {
+        let mut t = term(6, 2);
+        print_str(&mut t, "abcd");
+        t.cursor_goto(1, 0);
+        t.insert_chars(2);
+        assert_eq!(t.get_cell(0, 0).unwrap().ch, 'a');
+        assert_eq!(t.get_cell(1, 0).unwrap().ch, ' ');
+        assert_eq!(t.get_cell(3, 0).unwrap().ch, 'b');
+        t.delete_chars(2);
+        assert_eq!(t.get_cell(1, 0).unwrap().ch, 'b');
+        t.cursor_goto(2, 0);
+        t.erase_chars(2);
+        assert_eq!(t.get_cell(2, 0).unwrap().ch, ' ');
+        assert_eq!(t.get_cell(1, 0).unwrap().ch, 'b');
+    }
+
+    #[test]
+    fn csi_scroll_up_down_region() {
+        let mut t = term(3, 4);
+        for r in 0..4 {
+            t.cursor_goto(0, r);
+            t.print((b'a' + r as u8) as char);
+        }
+        t.set_scroll_region(2, 4);
+        t.csi_scroll_up(1);
+        assert_eq!(t.get_cell(0, 0).unwrap().ch, 'a');
+        assert_eq!(t.get_cell(0, 1).unwrap().ch, 'c');
+        t.csi_scroll_down(1);
+        assert_eq!(t.get_cell(0, 1).unwrap().ch, ' ');
+        assert_eq!(t.get_cell(0, 2).unwrap().ch, 'c');
+        t.csi_scroll_up(999);
+        assert_eq!(t.get_cell(0, 1).unwrap().ch, ' ');
+        assert_eq!(t.get_cell(0, 0).unwrap().ch, 'a');
+    }
+
+    #[test]
+    fn save_restore_cursor_with_attrs() {
+        let mut t = term(10, 3);
+        t.sgr(31);
+        t.sgr(1);
+        t.cursor_goto(3, 2);
+        t.save_cursor();
+        t.sgr(0);
+        t.cursor_goto(0, 0);
+        t.restore_cursor();
+        assert_eq!(t.cursor(), (3, 2));
+        t.print('x');
+        let cell = t.get_cell(3, 2).unwrap();
+        assert_eq!(cell.fg, Color::Indexed(1));
+        assert!(cell.flags.contains(CellFlags::BOLD));
+    }
+
+    #[test]
+    fn resize_resizes_alt_and_clamps_region() {
+        let mut t = term(5, 5);
+        t.set_scroll_region(2, 5);
+        t.set_alt_screen_47(true);
+        t.cursor_goto(0, 0);
+        print_str(&mut t, "alt");
+        t.resize(3, 3);
+        assert_eq!(t.scroll_region(), (1, 2));
+        assert_eq!(t.get_cell(0, 0).unwrap().ch, 'a');
+        assert!(t.get_cell(0, 4).is_none());
     }
 }
