@@ -18,6 +18,7 @@ pub struct WispWindow {
     pty: PtyManager,
     config: Config,
     clipboard: Option<arboard::Clipboard>,
+    last_title: Option<String>,
     mouse_pressed: bool,
     last_mouse_position: Option<PhysicalPosition<f64>>,
 }
@@ -67,6 +68,7 @@ impl WispWindow {
             pty,
             config,
             clipboard,
+            last_title: None,
             mouse_pressed: false,
             last_mouse_position: None,
         }
@@ -111,6 +113,18 @@ impl WispWindow {
                 String::from_utf8_lossy(&data)
             );
             self.parser.advance(&data);
+            // Answer terminal queries (DA, DSR, size report).
+            for reply in self.parser.take_replies() {
+                let _ = self.pty.write(&reply);
+            }
+        }
+
+        // Apply OSC title changes.
+        if let Some(title) = self.parser.terminal().title() {
+            if self.last_title.as_deref() != Some(title) {
+                self.window.set_title(title);
+                self.last_title = Some(title.to_owned());
+            }
         }
 
         self.renderer.render(self.parser.terminal());
