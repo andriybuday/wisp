@@ -51,6 +51,8 @@ pub struct Terminal {
     cursor_visible: bool,
     /// Bracketed paste mode (DEC private mode 2004) is enabled
     bracketed_paste: bool,
+    /// Window title set via OSC 0 / OSC 2
+    title: Option<String>,
     /// Text selection range: (start_col, start_row, end_col, end_row)
     selection: Option<(usize, usize, usize, usize)>,
     /// Scrollback offset (0 = at bottom, >0 = scrolled up)
@@ -73,6 +75,7 @@ impl Terminal {
             current_flags: CellFlags::empty(),
             cursor_visible: true,
             bracketed_paste: false,
+            title: None,
             selection: None,
             scroll_offset: 0,
         }
@@ -88,6 +91,14 @@ impl Terminal {
 
     pub fn set_bracketed_paste(&mut self, enabled: bool) {
         self.bracketed_paste = enabled;
+    }
+
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+
+    pub fn set_title(&mut self, title: String) {
+        self.title = Some(title);
     }
 
     pub fn rows(&self) -> usize {

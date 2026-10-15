@@ -10,7 +10,10 @@ impl AnsiParser {
     pub fn new(terminal: Terminal) -> Self {
         Self {
             parser: Parser::new(),
-            performer: AnsiPerformer { terminal },
+            performer: AnsiPerformer {
+                terminal,
+                replies: Vec::new(),
+            },
         }
     }
 
@@ -27,10 +30,17 @@ impl AnsiParser {
     pub fn terminal_mut(&mut self) -> &mut Terminal {
         &mut self.performer.terminal
     }
+
+    /// Drain pending query replies (DA, DSR, size report) to be written
+    /// back to the PTY.
+    pub fn take_replies(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.performer.replies)
+    }
 }
 
 struct AnsiPerformer {
     terminal: Terminal,
+    replies: Vec<Vec<u8>>,
 }
 
 impl Perform for AnsiPerformer {
@@ -54,7 +64,19 @@ impl Perform for AnsiPerformer {
 
     fn unhook(&mut self) {}
 
-    fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {}
+    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        // OSC 0 / OSC 2: set window title. All other OSC is ignored.
+        if (params.first() == Some(&b"0".as_slice()) || params.first() == Some(&b"2".as_slice()))
+            && params.len() >= 2
+        {
+            let title = String::from_utf8_lossy(params[1])
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(256)
+                .collect();
+            self.terminal.set_title(title);
+        }
+    }
 
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, c: char) {
         match c {
@@ -152,6 +174,54 @@ impl Perform for AnsiPerformer {
                     }
                 }
             }
+            'c' => {
+                // Device Attributes. Primary DA (no intermediate) reports
+                // VT102 on purpose: never advertise unimplemented features.
+                // Secondary DA (`CSI > c`) reports version 1. Other
+                // intermediates (e.g. `=`) are ignored.
+                let reply: Option<&[u8]> = if intermediates.is_empty() {
+                    Some(b"\x1b[?6c")
+                } else if intermediates == [b'>'] {
+                    Some(b"\x1b[>0;1;0c")
+                } else {
+                    None
+                };
+                if let Some(reply) = reply {
+                    self.replies.push(reply.to_vec());
+                }
+            }
+            'n' => {
+                // Device Status Report.
+                let n = params
+                    .iter()
+                    .next()
+                    .and_then(|p| p.first().copied())
+                    .unwrap_or(0);
+                match n {
+                    5 => self.replies.push(b"\x1b[0n".to_vec()),
+                    6 => {
+                        let (col, row) = self.terminal.cursor();
+                        self.replies
+                            .push(format!("\x1b[{};{}R", row + 1, col + 1).into_bytes());
+                    }
+                    _ => {}
+                }
+            }
+            't' => {
+                // Window manipulations. Only the text-area size report
+                // (`CSI 18 t`) is implemented; all others are ignored.
+                let n = params
+                    .iter()
+                    .next()
+                    .and_then(|p| p.first().copied())
+                    .unwrap_or(0);
+                if n == 18 {
+                    self.replies.push(
+                        format!("\x1b[8;{};{}t", self.terminal.rows(), self.terminal.cols())
+                            .into_bytes(),
+                    );
+                }
+            }
             _ => {}
         }
     }
@@ -243,5 +313,62 @@ mod tests {
         assert!(p.terminal().bracketed_paste());
         let p = run(b"\x1b[?2004h\x1b[?2004l");
         assert!(!p.terminal().bracketed_paste());
+    }
+
+    #[test]
+    fn primary_da_replies_vt102() {
+        let mut p = run(b"\x1b[c");
+        assert_eq!(p.take_replies(), vec![b"\x1b[?6c".to_vec()]);
+        // Drained: a second take without new queries is empty.
+        assert!(p.take_replies().is_empty());
+    }
+
+    #[test]
+    fn secondary_da_replies_version() {
+        let mut p = run(b"\x1b[>c");
+        assert_eq!(p.take_replies(), vec![b"\x1b[>0;1;0c".to_vec()]);
+    }
+
+    #[test]
+    fn dsr_5_replies_ready() {
+        let mut p = run(b"\x1b[5n");
+        assert_eq!(p.take_replies(), vec![b"\x1b[0n".to_vec()]);
+    }
+
+    #[test]
+    fn dsr_6_reports_1_based_cursor() {
+        // CSI H moves to (row 3, col 4) 1-based -> (3, 2) 0-based.
+        let mut p = run(b"\x1b[3;4H\x1b[6n");
+        assert_eq!(p.take_replies(), vec![b"\x1b[3;4R".to_vec()]);
+    }
+
+    #[test]
+    fn csi_18t_reports_text_area_size() {
+        let mut p = run(b"\x1b[18t");
+        // run() uses a 10x4 terminal.
+        assert_eq!(p.take_replies(), vec![b"\x1b[8;4;10t".to_vec()]);
+
+        let mut p = AnsiParser::new(Terminal::new(80, 24));
+        p.advance(b"\x1b[18t");
+        assert_eq!(p.take_replies(), vec![b"\x1b[8;24;80t".to_vec()]);
+    }
+
+    #[test]
+    fn osc_2_title_terminated_by_bell() {
+        let p = run(b"\x1b]2;My Title\x07");
+        assert_eq!(p.terminal().title(), Some("My Title"));
+    }
+
+    #[test]
+    fn osc_2_title_terminated_by_st() {
+        let p = run(b"\x1b]2;My Title\x1b\\");
+        assert_eq!(p.terminal().title(), Some("My Title"));
+    }
+
+    #[test]
+    fn osc_title_non_utf8_does_not_panic() {
+        let p = run(b"\x1b]2;\xff\xfe title\x07");
+        assert!(p.terminal().title().is_some());
+        assert!(p.terminal().title().unwrap().contains("title"));
     }
 }
