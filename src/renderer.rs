@@ -496,6 +496,13 @@ impl Renderer {
                     if cell.flags.contains(crate::terminal::CellFlags::INVERSE) {
                         std::mem::swap(&mut fg_color, &mut bg_color);
                     }
+                    // Dim: scale foreground RGB by 0.6, alpha unchanged.
+                    // Glyph, underline, and strikethrough all use fg_color.
+                    if cell.flags.contains(crate::terminal::CellFlags::DIM) {
+                        fg_color[0] *= 0.6;
+                        fg_color[1] *= 0.6;
+                        fg_color[2] *= 0.6;
+                    }
 
                     // Check if this cell is selected
                     let is_selected = terminal.is_cell_selected(col, row);
@@ -643,6 +650,39 @@ impl Renderer {
                             color: fg_color,
                         },
                     ]);
+
+                    // Render strikethrough if flag is set: 2px quad at
+                    // the vertical middle of the cell, mirroring underline.
+                    if cell
+                        .flags
+                        .contains(crate::terminal::CellFlags::STRIKETHROUGH)
+                    {
+                        let strike_y_ndc = y_ndc - cell_h_ndc * 0.5 + height_ndc;
+                        let strike_h_ndc = 2.0 * height_ndc;
+
+                        vertices.extend_from_slice(&[
+                            Vertex {
+                                position: [x_ndc, strike_y_ndc, 0.0],
+                                tex_coords: [bg_u0, bg_v0],
+                                color: fg_color,
+                            },
+                            Vertex {
+                                position: [x_ndc + cell_w_ndc, strike_y_ndc, 0.0],
+                                tex_coords: [bg_u1, bg_v0],
+                                color: fg_color,
+                            },
+                            Vertex {
+                                position: [x_ndc + cell_w_ndc, strike_y_ndc - strike_h_ndc, 0.0],
+                                tex_coords: [bg_u1, bg_v1],
+                                color: fg_color,
+                            },
+                            Vertex {
+                                position: [x_ndc, strike_y_ndc - strike_h_ndc, 0.0],
+                                tex_coords: [bg_u0, bg_v1],
+                                color: fg_color,
+                            },
+                        ]);
+                    }
 
                     // Render underline if flag is set
                     if cell.flags.contains(crate::terminal::CellFlags::UNDERLINE) {

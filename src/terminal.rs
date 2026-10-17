@@ -36,6 +36,8 @@ bitflags::bitflags! {
         const INVERSE = 0b1000;
         /// Second cell of a wide (width-2) character; `ch` is `' '`.
         const WIDE_SPACER = 0b0001_0000;
+        const DIM = 0b0010_0000;
+        const STRIKETHROUGH = 0b0100_0000;
     }
 }
 
@@ -641,21 +643,25 @@ impl Terminal {
     pub fn sgr(&mut self, param: usize) {
         // Handle SGR parameters (colors, bold, etc.)
         match param {
-            0 => self.reset_sgr(),                                           // Reset all
-            1 => self.current_flags.insert(CellFlags::BOLD),                 // Bold
-            3 => self.current_flags.insert(CellFlags::ITALIC),               // Italic
-            4 => self.current_flags.insert(CellFlags::UNDERLINE),            // Underline
-            7 => self.current_flags.insert(CellFlags::INVERSE),              // Inverse
-            22 => self.current_flags.remove(CellFlags::BOLD),                // Normal intensity
-            23 => self.current_flags.remove(CellFlags::ITALIC),              // Not italic
-            24 => self.current_flags.remove(CellFlags::UNDERLINE),           // Not underline
-            27 => self.current_flags.remove(CellFlags::INVERSE),             // Not inverse
+            0 => self.reset_sgr(),                                // Reset all
+            1 => self.current_flags.insert(CellFlags::BOLD),      // Bold
+            2 => self.current_flags.insert(CellFlags::DIM),       // Dim/faint
+            3 => self.current_flags.insert(CellFlags::ITALIC),    // Italic
+            4 => self.current_flags.insert(CellFlags::UNDERLINE), // Underline
+            // 5/6 (blink) fall through to the ignore arm by design.
+            7 => self.current_flags.insert(CellFlags::INVERSE), // Inverse
+            9 => self.current_flags.insert(CellFlags::STRIKETHROUGH), // Strikethrough
+            22 => self.current_flags.remove(CellFlags::BOLD | CellFlags::DIM), // Normal intensity
+            23 => self.current_flags.remove(CellFlags::ITALIC), // Not italic
+            24 => self.current_flags.remove(CellFlags::UNDERLINE), // Not underline
+            27 => self.current_flags.remove(CellFlags::INVERSE), // Not inverse
+            29 => self.current_flags.remove(CellFlags::STRIKETHROUGH), // Not strikethrough
             30..=37 => self.current_fg = Color::Indexed((param - 30) as u8), // FG 0-7
             40..=47 => self.current_bg = Color::Indexed((param - 40) as u8), // BG 0-7
             90..=97 => self.current_fg = Color::Indexed((param - 90 + 8) as u8), // FG 8-15
             100..=107 => self.current_bg = Color::Indexed((param - 100 + 8) as u8), // BG 8-15
-            39 => self.current_fg = Color::Default,                          // Default FG
-            49 => self.current_bg = Color::Default,                          // Default BG
+            39 => self.current_fg = Color::Default,             // Default FG
+            49 => self.current_bg = Color::Default,             // Default BG
             _ => {}
         }
     }
@@ -1197,6 +1203,51 @@ mod tests {
         t.sgr(22);
         t.sgr(24);
         t.sgr(27);
+        t.print('b');
+        assert!(t.get_cell(1, 0).unwrap().flags.is_empty());
+    }
+
+    #[test]
+    fn sgr_dim_and_strikethrough_set_and_clear() {
+        let mut t = term(10, 2);
+        t.sgr(2);
+        t.sgr(9);
+        t.print('a');
+        let f = t.get_cell(0, 0).unwrap().flags;
+        assert!(f.contains(CellFlags::DIM | CellFlags::STRIKETHROUGH));
+        t.sgr(29);
+        t.print('b');
+        let f = t.get_cell(1, 0).unwrap().flags;
+        assert!(f.contains(CellFlags::DIM));
+        assert!(!f.contains(CellFlags::STRIKETHROUGH));
+    }
+
+    #[test]
+    fn sgr_22_clears_bold_and_dim() {
+        let mut t = term(10, 2);
+        t.sgr(1);
+        t.sgr(2);
+        t.sgr(4);
+        t.sgr(22);
+        t.print('a');
+        let f = t.get_cell(0, 0).unwrap().flags;
+        assert!(!f.contains(CellFlags::BOLD));
+        assert!(!f.contains(CellFlags::DIM));
+        // Normal intensity leaves other attributes alone.
+        assert!(f.contains(CellFlags::UNDERLINE));
+    }
+
+    #[test]
+    fn sgr_reset_clears_dim_and_strikethrough_and_blink_ignored() {
+        let mut t = term(10, 2);
+        t.sgr(2);
+        t.sgr(9);
+        t.sgr(0);
+        t.print('a');
+        assert!(t.get_cell(0, 0).unwrap().flags.is_empty());
+        // Blink (5/6) is parsed and deliberately ignored.
+        t.sgr(5);
+        t.sgr(6);
         t.print('b');
         assert!(t.get_cell(1, 0).unwrap().flags.is_empty());
     }

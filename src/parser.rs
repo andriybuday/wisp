@@ -47,7 +47,10 @@ impl AnsiPerformer {
     /// Stateful SGR walk: simple codes go to `Terminal::sgr`, while extended
     /// colors (38/48) consume their operands in either semicolon form
     /// (separate params) or colon form (subparams in one param slice).
-    /// Truncated or malformed extended sequences leave the color unchanged.
+    /// Colon underline styles (`4:n`) set/clear underline without the
+    /// sub-style leaking as an SGR code, and underline color (58) is
+    /// consumed like 38/48 but ignored. Truncated or malformed extended
+    /// sequences leave the color unchanged.
     fn sgr_dispatch(&mut self, params: &Params) {
         use crate::terminal::Color;
         let slices: Vec<&[u16]> = params.iter().collect();
@@ -59,18 +62,29 @@ impl AnsiPerformer {
                 i += 1;
                 continue;
             };
-            if code != 38 && code != 48 {
+            // Colon underline style (`4:n`): any sub-style except 0 sets
+            // underline; `4:0` clears it. The sub-style must not be fed
+            // back as its own SGR code (e.g. `4:2` is not SGR 2/dim).
+            if code == 4 && slice.len() > 1 {
+                if slice[1] == 0 {
+                    self.terminal.sgr(24);
+                } else {
+                    self.terminal.sgr(4);
+                }
+                i += 1;
+                continue;
+            }
+            if code != 38 && code != 48 && code != 58 {
                 self.terminal.sgr(code as usize);
                 i += 1;
                 continue;
             }
-            // Extended color: 38 = foreground, 48 = background.
-            let apply = |t: &mut Terminal, color: Color| {
-                if code == 38 {
-                    t.set_fg_color(color);
-                } else {
-                    t.set_bg_color(color);
-                }
+            // Extended color: 38 = foreground, 48 = background. Underline
+            // color (58) shares the operand skipping but applies nothing.
+            let apply = |t: &mut Terminal, color: Color| match code {
+                38 => t.set_fg_color(color),
+                48 => t.set_bg_color(color),
+                _ => {}
             };
             if slice.len() > 1 {
                 // Colon form: mode and operands are subparams of this slice.
@@ -501,6 +515,72 @@ mod tests {
         assert_eq!(p.terminal().get_cell(2, 0).unwrap().fg, Color::Indexed(1));
         // Truncated colon forms behave the same way.
         let p = run(b"\x1b[31ma\x1b[38:5mb\x1b[38:2:1mc");
+        assert_eq!(p.terminal().get_cell(1, 0).unwrap().fg, Color::Indexed(1));
+        assert_eq!(p.terminal().get_cell(2, 0).unwrap().fg, Color::Indexed(1));
+    }
+
+    #[test]
+    fn csi_m_dim_and_strikethrough_through_parser() {
+        let p = run(b"\x1b[2ma\x1b[9mb");
+        let a = p.terminal().get_cell(0, 0).unwrap();
+        assert!(a.flags.contains(CellFlags::DIM));
+        assert!(!a.flags.contains(CellFlags::STRIKETHROUGH));
+        let b = p.terminal().get_cell(1, 0).unwrap();
+        assert!(b.flags.contains(CellFlags::DIM | CellFlags::STRIKETHROUGH));
+    }
+
+    #[test]
+    fn csi_m_colon_underline_style_sets_underline_not_substyle() {
+        // `4:2` (double underline) sets UNDERLINE; sub-style 2 must not
+        // leak as SGR 2 (DIM). Other styles behave the same.
+        let p = run(b"\x1b[4:2ma\x1b[4:3mb");
+        let a = p.terminal().get_cell(0, 0).unwrap();
+        assert!(a.flags.contains(CellFlags::UNDERLINE));
+        assert!(!a.flags.contains(CellFlags::DIM));
+        assert!(p
+            .terminal()
+            .get_cell(1, 0)
+            .unwrap()
+            .flags
+            .contains(CellFlags::UNDERLINE));
+    }
+
+    #[test]
+    fn csi_m_colon_underline_zero_clears_underline() {
+        let p = run(b"\x1b[4ma\x1b[4:0mb");
+        assert!(p
+            .terminal()
+            .get_cell(0, 0)
+            .unwrap()
+            .flags
+            .contains(CellFlags::UNDERLINE));
+        assert!(!p
+            .terminal()
+            .get_cell(1, 0)
+            .unwrap()
+            .flags
+            .contains(CellFlags::UNDERLINE));
+    }
+
+    #[test]
+    fn csi_m_underline_color_58_ignored() {
+        // Semicolon indexed and truecolor forms leave fg/bg untouched.
+        let p = run(b"\x1b[31;42ma\x1b[58;5;196mb\x1b[58;2;10;20;30mc");
+        for col in 0..3 {
+            let cell = p.terminal().get_cell(col, 0).unwrap();
+            assert_eq!((cell.fg, cell.bg), (Color::Indexed(1), Color::Indexed(2)));
+        }
+        // Colon forms likewise, including the empty-colorspace variant;
+        // following simple codes in the same SGR still apply.
+        let p = run(b"\x1b[31ma\x1b[58:2::255:0:0mb\x1b[58:5:9;32mc");
+        assert_eq!(p.terminal().get_cell(1, 0).unwrap().fg, Color::Indexed(1));
+        assert_eq!(p.terminal().get_cell(2, 0).unwrap().fg, Color::Indexed(2));
+        // A following `;31` after semicolon 58 still applies (operands
+        // are not over-consumed).
+        let p = run(b"\x1b[58;5;196;31ma");
+        assert_eq!(p.terminal().get_cell(0, 0).unwrap().fg, Color::Indexed(1));
+        // Truncated 58 never panics and leaves fg unchanged.
+        let p = run(b"\x1b[31ma\x1b[58;5mb\x1b[58mc");
         assert_eq!(p.terminal().get_cell(1, 0).unwrap().fg, Color::Indexed(1));
         assert_eq!(p.terminal().get_cell(2, 0).unwrap().fg, Color::Indexed(1));
     }
