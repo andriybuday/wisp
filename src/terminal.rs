@@ -39,6 +39,21 @@ bitflags::bitflags! {
     }
 }
 
+/// Mouse tracking level requested by the application (DEC private modes
+/// ?1000 / ?1002 / ?1003). Declaration order is the precedence order:
+/// a higher level replaces a lower one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MouseTracking {
+    /// No mouse reporting (?1000/?1002/?1003 all reset).
+    Off,
+    /// ?1000: report button press and release only.
+    Normal,
+    /// ?1002: press/release plus motion while a button is held.
+    ButtonEvent,
+    /// ?1003: press/release plus all motion.
+    AnyEvent,
+}
+
 /// Terminal state
 pub struct Terminal {
     /// Character grid
@@ -62,6 +77,12 @@ pub struct Terminal {
     cursor_visible: bool,
     /// Bracketed paste mode (DEC private mode 2004) is enabled
     bracketed_paste: bool,
+    /// Mouse tracking level (DEC private modes 1000/1002/1003)
+    mouse_tracking: MouseTracking,
+    /// SGR mouse encoding (DEC private mode 1006) is enabled
+    sgr_mouse: bool,
+    /// Focus in/out reporting (DEC private mode 1004) is enabled
+    focus_reporting: bool,
     /// Window title set via OSC 0 / OSC 2
     title: Option<String>,
     /// Text selection range: (start_col, start_row, end_col, end_row)
@@ -99,6 +120,9 @@ impl Terminal {
             current_flags: CellFlags::empty(),
             cursor_visible: true,
             bracketed_paste: false,
+            mouse_tracking: MouseTracking::Off,
+            sgr_mouse: false,
+            focus_reporting: false,
             title: None,
             selection: None,
             scroll_offset: 0,
@@ -232,6 +256,40 @@ impl Terminal {
 
     pub fn set_bracketed_paste(&mut self, enabled: bool) {
         self.bracketed_paste = enabled;
+    }
+
+    pub fn mouse_tracking(&self) -> MouseTracking {
+        self.mouse_tracking
+    }
+
+    /// DECSET/DECRST for one tracking mode (?1000/?1002/?1003). Enabling a
+    /// mode at or above the current level selects it (a lower mode never
+    /// downgrades a higher one); disabling the active mode drops tracking
+    /// to Off, and disabling any other mode is a no-op.
+    pub fn set_mouse_tracking(&mut self, mode: MouseTracking, enabled: bool) {
+        if enabled {
+            if mode >= self.mouse_tracking {
+                self.mouse_tracking = mode;
+            }
+        } else if mode == self.mouse_tracking {
+            self.mouse_tracking = MouseTracking::Off;
+        }
+    }
+
+    pub fn sgr_mouse(&self) -> bool {
+        self.sgr_mouse
+    }
+
+    pub fn set_sgr_mouse(&mut self, enabled: bool) {
+        self.sgr_mouse = enabled;
+    }
+
+    pub fn focus_reporting(&self) -> bool {
+        self.focus_reporting
+    }
+
+    pub fn set_focus_reporting(&mut self, enabled: bool) {
+        self.focus_reporting = enabled;
     }
 
     pub fn title(&self) -> Option<&str> {

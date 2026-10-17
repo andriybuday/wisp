@@ -1,4 +1,4 @@
-use crate::terminal::Terminal;
+use crate::terminal::{MouseTracking, Terminal};
 use vte::{Params, Parser, Perform};
 
 pub struct AnsiParser {
@@ -288,6 +288,17 @@ impl Perform for AnsiPerformer {
                         Some(47) => self.terminal.set_alt_screen_47(enabled),
                         Some(1047) => self.terminal.set_alt_screen_1047(enabled),
                         Some(1049) => self.terminal.set_alt_screen_1049(enabled),
+                        Some(1000) => self
+                            .terminal
+                            .set_mouse_tracking(MouseTracking::Normal, enabled),
+                        Some(1002) => self
+                            .terminal
+                            .set_mouse_tracking(MouseTracking::ButtonEvent, enabled),
+                        Some(1003) => self
+                            .terminal
+                            .set_mouse_tracking(MouseTracking::AnyEvent, enabled),
+                        Some(1004) => self.terminal.set_focus_reporting(enabled),
+                        Some(1006) => self.terminal.set_sgr_mouse(enabled),
                         Some(2004) => self.terminal.set_bracketed_paste(enabled),
                         _ => {}
                     }
@@ -673,6 +684,77 @@ mod tests {
         assert!(spacer.flags.contains(CellFlags::WIDE_SPACER));
         assert_eq!(p.terminal().get_cell(3, 0).unwrap().ch, 'b');
         assert_eq!(p.terminal().cursor(), (4, 0));
+    }
+
+    #[test]
+    fn mouse_tracking_modes_set_and_reset() {
+        use crate::terminal::MouseTracking;
+        // Defaults: everything off.
+        let p = run(b"");
+        assert_eq!(p.terminal().mouse_tracking(), MouseTracking::Off);
+        assert!(!p.terminal().sgr_mouse());
+        assert!(!p.terminal().focus_reporting());
+        // Each tracking mode selects its level; resetting it turns tracking off.
+        let p = run(b"\x1b[?1000h");
+        assert_eq!(p.terminal().mouse_tracking(), MouseTracking::Normal);
+        let p = run(b"\x1b[?1000h\x1b[?1000l");
+        assert_eq!(p.terminal().mouse_tracking(), MouseTracking::Off);
+        let p = run(b"\x1b[?1002h");
+        assert_eq!(p.terminal().mouse_tracking(), MouseTracking::ButtonEvent);
+        let p = run(b"\x1b[?1002h\x1b[?1002l");
+        assert_eq!(p.terminal().mouse_tracking(), MouseTracking::Off);
+        let p = run(b"\x1b[?1003h");
+        assert_eq!(p.terminal().mouse_tracking(), MouseTracking::AnyEvent);
+        let p = run(b"\x1b[?1003h\x1b[?1003l");
+        assert_eq!(p.terminal().mouse_tracking(), MouseTracking::Off);
+    }
+
+    #[test]
+    fn mouse_tracking_precedence_higher_wins_reset_drops_to_off() {
+        use crate::terminal::MouseTracking;
+        // Setting a higher mode replaces the lower one.
+        let p = run(b"\x1b[?1000h\x1b[?1002h");
+        assert_eq!(p.terminal().mouse_tracking(), MouseTracking::ButtonEvent);
+        let p = run(b"\x1b[?1002h\x1b[?1003h");
+        assert_eq!(p.terminal().mouse_tracking(), MouseTracking::AnyEvent);
+        // Setting a lower mode does not downgrade a higher one.
+        let p = run(b"\x1b[?1003h\x1b[?1000h");
+        assert_eq!(p.terminal().mouse_tracking(), MouseTracking::AnyEvent);
+        let p = run(b"\x1b[?1002h\x1b[?1000h");
+        assert_eq!(p.terminal().mouse_tracking(), MouseTracking::ButtonEvent);
+        // Resetting the active mode drops to Off (no fall-back to the
+        // lower mode that was set earlier).
+        let p = run(b"\x1b[?1000h\x1b[?1002h\x1b[?1002l");
+        assert_eq!(p.terminal().mouse_tracking(), MouseTracking::Off);
+        // Resetting a mode that is not active is a no-op.
+        let p = run(b"\x1b[?1003h\x1b[?1000l");
+        assert_eq!(p.terminal().mouse_tracking(), MouseTracking::AnyEvent);
+        let p = run(b"\x1b[?1000h\x1b[?1003l");
+        assert_eq!(p.terminal().mouse_tracking(), MouseTracking::Normal);
+        // Combined params in one sequence apply left to right.
+        let p = run(b"\x1b[?1000;1006h");
+        assert_eq!(p.terminal().mouse_tracking(), MouseTracking::Normal);
+        assert!(p.terminal().sgr_mouse());
+    }
+
+    #[test]
+    fn sgr_mouse_1006_and_focus_reporting_1004_set_and_reset() {
+        let p = run(b"\x1b[?1006h");
+        assert!(p.terminal().sgr_mouse());
+        let p = run(b"\x1b[?1006h\x1b[?1006l");
+        assert!(!p.terminal().sgr_mouse());
+        let p = run(b"\x1b[?1004h");
+        assert!(p.terminal().focus_reporting());
+        let p = run(b"\x1b[?1004h\x1b[?1004l");
+        assert!(!p.terminal().focus_reporting());
+        // The flags are independent of the tracking level.
+        let p = run(b"\x1b[?1006h\x1b[?1004h\x1b[?1000h\x1b[?1000l");
+        assert!(p.terminal().sgr_mouse());
+        assert!(p.terminal().focus_reporting());
+        assert_eq!(
+            p.terminal().mouse_tracking(),
+            crate::terminal::MouseTracking::Off
+        );
     }
 
     #[test]

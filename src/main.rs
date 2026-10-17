@@ -24,6 +24,7 @@ fn main() {
     event_loop.set_control_flow(ControlFlow::Poll);
 
     let mut modifiers = ModifiersState::empty();
+    let mut pressed_buttons: Vec<MouseButton> = Vec::new();
 
     event_loop
         .run(move |event, elwt| match event {
@@ -80,27 +81,30 @@ fn main() {
                             }
                         }
                     }
-                    WindowEvent::MouseInput { state, button, .. } => {
-                        if button == MouseButton::Left {
-                            match state {
-                                ElementState::Pressed => {
-                                    wisp_window.mouse_press();
-                                }
-                                ElementState::Released => {
-                                    wisp_window.mouse_release();
-                                }
-                            }
-                        }
+                    WindowEvent::Focused(focused) => {
+                        wisp_window.focus_changed(focused);
                     }
+                    WindowEvent::MouseInput { state, button, .. } => match state {
+                        ElementState::Pressed => {
+                            if !pressed_buttons.contains(&button) {
+                                pressed_buttons.push(button);
+                            }
+                            wisp_window.mouse_press(button, modifiers);
+                        }
+                        ElementState::Released => {
+                            pressed_buttons.retain(|b| *b != button);
+                            wisp_window.mouse_release(button, modifiers);
+                        }
+                    },
                     WindowEvent::CursorMoved { position, .. } => {
-                        wisp_window.mouse_move(position);
+                        wisp_window.mouse_move(position, modifiers, &pressed_buttons);
                     }
                     WindowEvent::MouseWheel { delta, .. } => {
                         let delta_y = match delta {
                             MouseScrollDelta::LineDelta(_x, y) => y * 3.0,
                             MouseScrollDelta::PixelDelta(pos) => pos.y as f32,
                         };
-                        wisp_window.mouse_wheel(delta_y);
+                        wisp_window.mouse_wheel(delta_y, modifiers);
                     }
                     WindowEvent::Ime(ime) => match ime {
                         Ime::Commit(text) => {
