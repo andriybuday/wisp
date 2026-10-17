@@ -217,6 +217,25 @@ mod tests {
     }
 
     #[test]
+    fn with_shell_override_spawns_exiting_shell() {
+        // Cross-feature (009 + 010): the config shell override goes through
+        // the same retained-child spawn path, so exit is observable.
+        let mut pty = PtyManager::with_shell(80, 24, Some("/bin/sh".to_string()))
+            .expect("spawn /bin/sh via with_shell");
+        assert!(!pty.has_exited(), "interactive shell should be running");
+        pty.write(b"exit\n").expect("write exit to shell");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !pty.has_exited() {
+            assert!(
+                Instant::now() < deadline,
+                "shell did not exit within 2s after `exit`"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
     fn running_child_is_not_reported_exited() {
         let mut pty = spawn_sh("sleep 5");
 

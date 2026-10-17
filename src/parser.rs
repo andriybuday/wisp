@@ -779,4 +779,28 @@ mod tests {
         assert_eq!(p.terminal().get_cell(0, 0).unwrap().ch, 'X');
         assert_eq!(p.terminal().get_cell(0, 0).unwrap().fg, Color::Indexed(196));
     }
+
+    #[test]
+    fn wave2_all_private_modes_coexist() {
+        // Cross-feature (002 + 004 + 007 + 008): every DEC private mode set
+        // in one stream applies independently and resets independently.
+        use crate::terminal::MouseTracking;
+        let p = run(b"\x1b[?1003h\x1b[?1006h\x1b[?1004h\x1b[?2026h\x1b[?25l\x1b[?2004h");
+        let t = p.terminal();
+        assert_eq!(t.mouse_tracking(), MouseTracking::AnyEvent);
+        assert!(t.sgr_mouse());
+        assert!(t.focus_reporting());
+        assert!(t.sync_output());
+        assert!(!t.cursor_visible());
+        assert!(t.bracketed_paste());
+
+        let p = run(b"\x1b[?1003h\x1b[?1006h\x1b[?1004h\x1b[?2026h\x1b[?25l\
+              \x1b[?2026l\x1b[?1004l\x1b[?25h");
+        let t = p.terminal();
+        assert!(!t.sync_output());
+        assert!(!t.focus_reporting());
+        assert!(t.cursor_visible());
+        assert_eq!(t.mouse_tracking(), MouseTracking::AnyEvent);
+        assert!(t.sgr_mouse());
+    }
 }
