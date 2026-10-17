@@ -1,12 +1,19 @@
 use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use std::io::{Read, Write};
 use std::sync::mpsc::{channel, Receiver};
+use std::sync::{Arc, Mutex};
 use std::thread;
+
+type WakerCell = Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>;
 
 pub struct PtyManager {
     writer: Box<dyn Write + Send>,
     receiver: Receiver<Vec<u8>>,
     master: Box<dyn MasterPty + Send>,
+    /// Shared waker invoked by the reader thread after each successful
+    /// send, so the event loop can sleep until output exists. Installed
+    /// via [`PtyManager::set_waker`] right after construction.
+    waker: WakerCell,
 }
 
 impl PtyManager {
@@ -37,6 +44,9 @@ impl PtyManager {
 
         let (sender, receiver) = channel();
 
+        let waker: WakerCell = Arc::new(Mutex::new(None));
+        let reader_waker = waker.clone();
+
         // Spawn thread to read from PTY
         thread::spawn(move || {
             let mut buffer = [0u8; 4096];
@@ -45,6 +55,12 @@ impl PtyManager {
                     Ok(n) if n > 0 => {
                         if sender.send(buffer[..n].to_vec()).is_err() {
                             break;
+                        }
+                        // Wake the event loop; clone out from under the
+                        // lock so the callback never runs while holding it.
+                        let waker_fn = reader_waker.lock().ok().and_then(|guard| guard.clone());
+                        if let Some(waker_fn) = waker_fn {
+                            waker_fn();
                         }
                     }
                     Ok(_) => {
@@ -63,7 +79,17 @@ impl PtyManager {
             writer,
             receiver,
             master,
+            waker,
         })
+    }
+
+    /// Install the waker the reader thread calls after each successful
+    /// send. Output produced before this is called stays queued in the
+    /// channel and is picked up on the next wake/redraw.
+    pub fn set_waker(&mut self, waker: Arc<dyn Fn() + Send + Sync>) {
+        if let Ok(mut guard) = self.waker.lock() {
+            *guard = Some(waker);
+        }
     }
 
     pub fn write(&mut self, data: &[u8]) -> Result<(), std::io::Error> {

@@ -62,6 +62,9 @@ pub struct Terminal {
     cursor_visible: bool,
     /// Bracketed paste mode (DEC private mode 2004) is enabled
     bracketed_paste: bool,
+    /// Synchronized output (DEC private mode 2026) is enabled: the window
+    /// holds presentation until the mode is reset (or its failsafe fires).
+    sync_output: bool,
     /// Window title set via OSC 0 / OSC 2
     title: Option<String>,
     /// Text selection range: (start_col, start_row, end_col, end_row)
@@ -99,6 +102,7 @@ impl Terminal {
             current_flags: CellFlags::empty(),
             cursor_visible: true,
             bracketed_paste: false,
+            sync_output: false,
             title: None,
             selection: None,
             scroll_offset: 0,
@@ -223,6 +227,14 @@ impl Terminal {
 
     pub fn set_bracketed_paste(&mut self, enabled: bool) {
         self.bracketed_paste = enabled;
+    }
+
+    pub fn sync_output(&self) -> bool {
+        self.sync_output
+    }
+
+    pub fn set_sync_output(&mut self, enabled: bool) {
+        self.sync_output = enabled;
     }
 
     pub fn title(&self) -> Option<&str> {
@@ -1522,6 +1534,16 @@ mod tests {
         t.print('b');
         assert_eq!(t.get_cell(1, 0).unwrap().ch, 'b');
         assert_eq!(t.cursor(), (2, 0));
+    }
+
+    #[test]
+    fn sync_output_defaults_off_and_toggles() {
+        let mut t = term(10, 2);
+        assert!(!t.sync_output());
+        t.set_sync_output(true);
+        assert!(t.sync_output());
+        t.set_sync_output(false);
+        assert!(!t.sync_output());
     }
 
     #[test]

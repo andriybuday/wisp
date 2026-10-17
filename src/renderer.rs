@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use wgpu::util::DeviceExt;
 use winit::{dpi::PhysicalSize, window::Window};
 
 use crate::config::{ColorPalette, Config};
@@ -58,6 +57,13 @@ pub struct Renderer {
     atlas_slot: u32,
     atlas_cols: u32,
     glyph_positions: std::collections::HashMap<char, (u32, u32)>,
+    /// Persistent frame buffers, recreated only when capacity must grow
+    /// and updated in place via `queue.write_buffer`. Capacities are in
+    /// vertices / indices respectively.
+    vertex_buffer: Option<wgpu::Buffer>,
+    index_buffer: Option<wgpu::Buffer>,
+    vertex_capacity: usize,
+    index_capacity: usize,
 }
 
 /// Side length of the (square) glyph atlas texture, in texels.
@@ -285,6 +291,10 @@ impl Renderer {
             atlas_slot,
             atlas_cols,
             glyph_positions: std::collections::HashMap::new(),
+            vertex_buffer: None,
+            index_buffer: None,
+            vertex_capacity: 0,
+            index_capacity: 0,
         }
     }
 
@@ -297,11 +307,42 @@ impl Renderer {
         }
     }
 
-    pub fn render(&mut self, terminal: &Terminal) {
-        let output = self
-            .surface
-            .get_current_texture()
-            .expect("Failed to get surface texture");
+    /// Grow the persistent frame buffers if `vertex_count`/`index_count`
+    /// exceed capacity; otherwise leave them untouched.
+    fn ensure_buffer_capacity(&mut self, vertex_count: usize, index_count: usize) {
+        if self.vertex_buffer.is_none() || vertex_count > self.vertex_capacity {
+            self.vertex_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Vertex Buffer"),
+                size: (vertex_count * std::mem::size_of::<Vertex>()) as wgpu::BufferAddress,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+            self.vertex_capacity = vertex_count;
+        }
+        if self.index_buffer.is_none() || index_count > self.index_capacity {
+            self.index_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Index Buffer"),
+                size: (index_count * std::mem::size_of::<u32>()) as wgpu::BufferAddress,
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+            self.index_capacity = index_count;
+        }
+    }
+
+    pub fn render(&mut self, terminal: &Terminal, blink_on: bool) {
+        let output = match self.surface.get_current_texture() {
+            Ok(output) => output,
+            Err(wgpu::SurfaceError::Lost) | Err(wgpu::SurfaceError::Outdated) => {
+                self.surface.configure(&self.device, &self.config);
+                return;
+            }
+            Err(wgpu::SurfaceError::Timeout) => return,
+            Err(wgpu::SurfaceError::OutOfMemory) => {
+                log::error!("Surface out of memory");
+                return;
+            }
+        };
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -313,8 +354,8 @@ impl Renderer {
             });
 
         // Build vertices for all visible characters
-        let vertices = self.build_vertices(terminal);
-        let indices = self.build_indices(vertices.len() / 4);
+        let vertices = self.build_vertices(terminal, blink_on);
+        let indices = Self::build_indices(vertices.len() / 4);
 
         log::debug!(
             "Render: vertices={}, indices={}",
@@ -352,21 +393,19 @@ impl Renderer {
             return;
         }
 
-        let vertex_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Vertex Buffer"),
-                contents: bytemuck::cast_slice(&vertices),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-
-        let index_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Index Buffer"),
-                contents: bytemuck::cast_slice(&indices),
-                usage: wgpu::BufferUsages::INDEX,
-            });
+        self.ensure_buffer_capacity(vertices.len(), indices.len());
+        // Just ensured, so both buffers exist.
+        let (Some(vertex_buffer), Some(index_buffer)) =
+            (self.vertex_buffer.as_ref(), self.index_buffer.as_ref())
+        else {
+            return;
+        };
+        self.queue
+            .write_buffer(vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+        self.queue
+            .write_buffer(index_buffer, 0, bytemuck::cast_slice(&indices));
+        let vertex_bytes = (vertices.len() * std::mem::size_of::<Vertex>()) as u64;
+        let index_bytes = (indices.len() * std::mem::size_of::<u32>()) as u64;
 
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -391,8 +430,9 @@ impl Renderer {
 
             render_pass.set_pipeline(&self.pipeline);
             render_pass.set_bind_group(0, &self.texture_bind_group, &[]);
-            render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-            render_pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            render_pass.set_vertex_buffer(0, vertex_buffer.slice(..vertex_bytes));
+            render_pass
+                .set_index_buffer(index_buffer.slice(..index_bytes), wgpu::IndexFormat::Uint32);
             render_pass.draw_indexed(0..indices.len() as u32, 0, 0..1);
         }
 
@@ -400,7 +440,7 @@ impl Renderer {
         output.present();
     }
 
-    fn build_vertices(&mut self, terminal: &Terminal) -> Vec<Vertex> {
+    fn build_vertices(&mut self, terminal: &Terminal, blink_on: bool) -> Vec<Vertex> {
         let mut vertices = Vec::new();
 
         let cell_width = self.font_manager.cell_width();
@@ -409,6 +449,11 @@ impl Renderer {
 
         let width_ndc = 2.0 / self.size.width as f32;
         let height_ndc = 2.0 / self.size.height as f32;
+
+        // The cursor is shown only in the blink-on phase, when the app has
+        // not hidden it, and when the viewport is not scrolled back.
+        let show_cursor = blink_on && terminal.cursor_visible() && terminal.scroll_offset() == 0;
+        let (cursor_col, cursor_row) = terminal.cursor();
 
         // Texture coords for solid color (white pixel at 0,0)
         let bg_u0 = 0.0;
@@ -459,10 +504,21 @@ impl Renderer {
                         bg_color = [0.3, 0.5, 0.7, 1.0];
                     }
 
+                    // Shown cursor: it becomes this cell's background, and
+                    // the glyph (drawn below, after the background quad)
+                    // takes the palette background color so the character
+                    // under the cursor stays readable.
+                    let is_cursor = show_cursor && col == cursor_col && row == cursor_row;
+                    if is_cursor {
+                        bg_color = self.color_palette.cursor;
+                        fg_color = self.color_palette.background;
+                    }
+
                     // Render background if not the default (or if inverse or selected)
                     if cell.bg != Color::Default
                         || cell.flags.contains(crate::terminal::CellFlags::INVERSE)
                         || is_selected
+                        || is_cursor
                     {
                         // Background quad (using a solid color, no texture)
                         vertices.extend_from_slice(&[
@@ -624,55 +680,47 @@ impl Renderer {
             }
         }
 
-        // Render cursor (only if not scrolled)
-        if terminal.cursor_visible() && terminal.scroll_offset() == 0 {
-            let (cursor_col, cursor_row) = terminal.cursor();
-            if cursor_col < terminal.cols() && cursor_row < terminal.rows() {
-                let x = cursor_col as f32 * cell_width + self.padding;
-                let y = cursor_row as f32 * cell_height + self.padding;
-
-                let x_ndc = x * width_ndc - 1.0;
-                let y_ndc = 1.0 - y * height_ndc;
-                let cell_w_ndc = cell_width * width_ndc;
-                let cell_h_ndc = cell_height * height_ndc;
-
-                let cursor_color = self.color_palette.cursor;
-
-                // Cursor is a solid block
-                vertices.extend_from_slice(&[
-                    Vertex {
-                        position: [x_ndc, y_ndc, 0.0],
-                        tex_coords: [bg_u0, bg_v0],
-                        color: cursor_color,
-                    },
-                    Vertex {
-                        position: [x_ndc + cell_w_ndc, y_ndc, 0.0],
-                        tex_coords: [bg_u1, bg_v0],
-                        color: cursor_color,
-                    },
-                    Vertex {
-                        position: [x_ndc + cell_w_ndc, y_ndc - cell_h_ndc, 0.0],
-                        tex_coords: [bg_u1, bg_v1],
-                        color: cursor_color,
-                    },
-                    Vertex {
-                        position: [x_ndc, y_ndc - cell_h_ndc, 0.0],
-                        tex_coords: [bg_u0, bg_v1],
-                        color: cursor_color,
-                    },
-                ]);
-            }
-        }
-
+        // No separate cursor block: the cursor cell is handled inline
+        // above (cursor-colored background, glyph in background color),
+        // so the character under the cursor is never hidden.
         vertices
     }
 
-    fn build_indices(&self, quad_count: usize) -> Vec<u16> {
+    fn build_indices(quad_count: usize) -> Vec<u32> {
         let mut indices = Vec::new();
         for i in 0..quad_count {
-            let base = (i * 4) as u16;
+            let base = (i * 4) as u32;
             indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
         }
         indices
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_indices_empty_and_single_quad() {
+        assert!(Renderer::build_indices(0).is_empty());
+        assert_eq!(Renderer::build_indices(1), vec![0, 1, 2, 0, 2, 3]);
+    }
+
+    #[test]
+    fn build_indices_20000_quads_do_not_wrap_u32() {
+        let indices = Renderer::build_indices(20_000);
+        assert_eq!(indices.len(), 20_000 * 6);
+        // First quad.
+        assert_eq!(&indices[0..6], &[0, 1, 2, 0, 2, 3]);
+        // Quad 16384 is where u16 indices would have wrapped (base 65536).
+        assert_eq!(
+            &indices[16_384 * 6..16_384 * 6 + 6],
+            &[65536, 65537, 65538, 65536, 65538, 65539]
+        );
+        // Last quad (19999): base = 79996.
+        assert_eq!(
+            &indices[indices.len() - 6..],
+            &[79996, 79997, 79998, 79996, 79998, 79999]
+        );
     }
 }

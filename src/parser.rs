@@ -289,6 +289,7 @@ impl Perform for AnsiPerformer {
                         Some(1047) => self.terminal.set_alt_screen_1047(enabled),
                         Some(1049) => self.terminal.set_alt_screen_1049(enabled),
                         Some(2004) => self.terminal.set_bracketed_paste(enabled),
+                        Some(2026) => self.terminal.set_sync_output(enabled),
                         _ => {}
                     }
                 }
@@ -499,6 +500,19 @@ mod tests {
         assert!(p.terminal().bracketed_paste());
         let p = run(b"\x1b[?2004h\x1b[?2004l");
         assert!(!p.terminal().bracketed_paste());
+    }
+
+    #[test]
+    fn sync_output_mode_2026_set_and_reset() {
+        let p = run(b"a");
+        assert!(!p.terminal().sync_output());
+        let p = run(b"\x1b[?2026h");
+        assert!(p.terminal().sync_output());
+        let p = run(b"\x1b[?2026hab\x1b[?2026l");
+        assert!(!p.terminal().sync_output());
+        // Content inside the sync is still parsed normally.
+        assert_eq!(p.terminal().get_cell(0, 0).unwrap().ch, 'a');
+        assert_eq!(p.terminal().get_cell(1, 0).unwrap().ch, 'b');
     }
 
     #[test]
