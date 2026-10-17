@@ -54,6 +54,13 @@ pub struct WispWindow {
     next_blink: Instant,
     /// When the current synchronized-output hold was first observed.
     sync_since: Option<Instant>,
+    /// Scrollback search session: while active, keys edit the query
+    /// instead of going to the PTY and the title shows search feedback.
+    search_active: bool,
+    search_query: String,
+    /// Cached matches as `(absolute_line, start_col, end_col)`.
+    search_matches: Vec<(usize, usize, usize)>,
+    search_current: usize,
 }
 
 /// Find the `http://`/`https://` URL in `row` covering `byte_index`, if
@@ -197,6 +204,10 @@ impl WispWindow {
             blink_on: true,
             next_blink: Instant::now() + BLINK_PERIOD,
             sync_since: None,
+            search_active: false,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            search_current: 0,
         }
     }
 
@@ -228,6 +239,11 @@ impl WispWindow {
         // Resize terminal and PTY
         self.parser.terminal_mut().resize(new_cols, new_rows);
         self.pty.resize(new_cols as u16, new_rows as u16);
+
+        // Reflow moved lines; recompute an active search's matches.
+        if self.search_active {
+            self.refresh_search();
+        }
 
         self.window.request_redraw();
     }
@@ -261,12 +277,22 @@ impl WispWindow {
                 self.sync_since = None;
             }
 
-            // Apply OSC title changes.
+            // Apply OSC title changes. While searching the title
+            // carries search feedback, so only record the OSC title;
+            // `end_search` restores it.
             if let Some(title) = self.parser.terminal().title() {
                 if self.last_title.as_deref() != Some(title) {
-                    self.window.set_title(title);
+                    if !self.search_active {
+                        self.window.set_title(title);
+                    }
                     self.last_title = Some(title.to_owned());
                 }
+            }
+
+            // New output may have moved absolute lines: refresh the
+            // matches and re-scroll to the current one.
+            if self.search_active {
+                self.refresh_search();
             }
         }
 
@@ -333,7 +359,130 @@ impl WispWindow {
     }
 
     pub fn render(&mut self) {
-        self.renderer.render(self.parser.terminal(), self.blink_on);
+        // Convert absolute search matches to viewport rows for this
+        // frame's scroll offset, tracking the current match's entry.
+        let mut highlights: Vec<(usize, usize, usize)> = Vec::new();
+        let mut current: Option<usize> = None;
+        if self.search_active {
+            let terminal = self.parser.terminal();
+            for (i, &(abs_line, start_col, end_col)) in self.search_matches.iter().enumerate() {
+                if let Some(row) = terminal.abs_line_to_viewport_row(abs_line) {
+                    if i == self.search_current {
+                        current = Some(highlights.len());
+                    }
+                    highlights.push((row, start_col, end_col));
+                }
+            }
+        }
+        self.renderer
+            .render(self.parser.terminal(), self.blink_on, &highlights, current);
+    }
+
+    // Scrollback search session
+
+    pub fn search_active(&self) -> bool {
+        self.search_active
+    }
+
+    /// Begin a search session with an empty query.
+    pub fn start_search(&mut self) {
+        self.search_active = true;
+        self.search_query.clear();
+        self.search_matches.clear();
+        self.search_current = 0;
+        self.update_search_title();
+        self.window.request_redraw();
+    }
+
+    /// End the search session, restoring the recorded OSC title (or
+    /// the default) that the search title had replaced.
+    pub fn end_search(&mut self) {
+        self.search_active = false;
+        self.search_query.clear();
+        self.search_matches.clear();
+        self.search_current = 0;
+        let title = self.last_title.as_deref().unwrap_or("Wisp Terminal");
+        self.window.set_title(title);
+        self.window.request_redraw();
+    }
+
+    /// Append one character to the query and jump to the (clamped)
+    /// current match.
+    pub fn search_push_char(&mut self, ch: char) {
+        if !self.search_active {
+            return;
+        }
+        self.search_query.push(ch);
+        self.refresh_search();
+    }
+
+    /// Delete the last query character, if any.
+    pub fn search_backspace(&mut self) {
+        if !self.search_active {
+            return;
+        }
+        self.search_query.pop();
+        self.refresh_search();
+    }
+
+    /// Move to the next match, wrapping from last to first.
+    pub fn search_next(&mut self) {
+        if !self.search_active || self.search_matches.is_empty() {
+            return;
+        }
+        self.search_current = (self.search_current + 1) % self.search_matches.len();
+        self.jump_to_current_match();
+        self.update_search_title();
+        self.window.request_redraw();
+    }
+
+    /// Move to the previous match, wrapping from first to last.
+    pub fn search_prev(&mut self) {
+        if !self.search_active || self.search_matches.is_empty() {
+            return;
+        }
+        let len = self.search_matches.len();
+        self.search_current = (self.search_current + len - 1) % len;
+        self.jump_to_current_match();
+        self.update_search_title();
+        self.window.request_redraw();
+    }
+
+    /// Recompute matches for the current query, keep the current
+    /// index clamped, scroll to it, and refresh title + frame.
+    fn refresh_search(&mut self) {
+        let matches = self.parser.terminal().find_matches(&self.search_query);
+        self.search_matches = matches;
+        if self.search_matches.is_empty() {
+            self.search_current = 0;
+        } else if self.search_current >= self.search_matches.len() {
+            self.search_current = self.search_matches.len() - 1;
+        }
+        self.jump_to_current_match();
+        self.update_search_title();
+        self.window.request_redraw();
+    }
+
+    fn jump_to_current_match(&mut self) {
+        if let Some(&(abs_line, _, _)) = self.search_matches.get(self.search_current) {
+            self.parser.terminal_mut().scroll_to_absolute_line(abs_line);
+        }
+    }
+
+    fn update_search_title(&self) {
+        let title = if self.search_query.is_empty() {
+            "Search: ".to_owned()
+        } else if self.search_matches.is_empty() {
+            format!("Search: {} (no matches)", self.search_query)
+        } else {
+            format!(
+                "Search: {} ({}/{})",
+                self.search_query,
+                self.search_current + 1,
+                self.search_matches.len()
+            )
+        };
+        self.window.set_title(&title);
     }
 
     /// Has the shell (PTY child) exited? The event loop closes the window

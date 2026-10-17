@@ -75,10 +75,53 @@ fn main() {
                                 let paste_combo = modifiers.super_key()
                                     || (modifiers.control_key() && modifiers.shift_key());
 
+                                // Find: Cmd+F (macOS) or Ctrl+Shift+F (others).
+                                let is_f =
+                                    event.physical_key == PhysicalKey::Code(KeyCode::KeyF);
+                                let find_combo = modifiers.super_key()
+                                    || (modifiers.control_key() && modifiers.shift_key());
+
                                 if is_c && copy_combo {
                                     wisp_window.copy_selection();
                                 } else if is_v && paste_combo {
                                     wisp_window.paste();
+                                } else if is_f && find_combo {
+                                    wisp_window.start_search();
+                                } else if wisp_window.search_active() {
+                                    // While searching, keys edit/step
+                                    // the search instead of the PTY.
+                                    match event.physical_key {
+                                        PhysicalKey::Code(KeyCode::Escape) => {
+                                            wisp_window.end_search();
+                                        }
+                                        PhysicalKey::Code(KeyCode::Enter)
+                                        | PhysicalKey::Code(KeyCode::NumpadEnter) => {
+                                            if modifiers.shift_key() {
+                                                wisp_window.search_prev();
+                                            } else {
+                                                wisp_window.search_next();
+                                            }
+                                        }
+                                        PhysicalKey::Code(KeyCode::Backspace) => {
+                                            wisp_window.search_backspace();
+                                        }
+                                        _ => {
+                                            // Plain text appends; combos
+                                            // (Ctrl/Cmd/Alt) are swallowed.
+                                            if !modifiers.control_key()
+                                                && !modifiers.super_key()
+                                                && !modifiers.alt_key()
+                                            {
+                                                if let Some(text) = event.text.as_ref() {
+                                                    for ch in text.chars() {
+                                                        if !ch.is_control() {
+                                                            wisp_window.search_push_char(ch);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                 } else {
                                     let text =
                                         event.text.as_ref().map(|s| s.as_str()).unwrap_or("");
@@ -128,7 +171,15 @@ fn main() {
                         WindowEvent::Ime(ime) => match ime {
                             Ime::Commit(text) => {
                                 log::debug!("IME Commit: '{}'", text);
-                                wisp_window.send_input(text.as_bytes());
+                                if wisp_window.search_active() {
+                                    for ch in text.chars() {
+                                        if !ch.is_control() {
+                                            wisp_window.search_push_char(ch);
+                                        }
+                                    }
+                                } else {
+                                    wisp_window.send_input(text.as_bytes());
+                                }
                             }
                             Ime::Preedit(_, _) => {
                                 // Ignore preedit for now

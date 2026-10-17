@@ -1520,6 +1520,109 @@ impl Terminal {
         }
         lines.join("\n")
     }
+
+    // Scrollback search (absolute lines, same line space as selection)
+
+    /// Total number of absolute lines: scrollback followed by grid
+    /// rows, or just the alt-grid rows on the alternate screen.
+    fn total_abs_lines(&self) -> usize {
+        if self.on_alt {
+            self.rows
+        } else {
+            self.scrollback.len() + self.rows
+        }
+    }
+
+    /// Find all occurrences of `query` over the absolute lines,
+    /// returning `(absolute_line, start_col, end_col_exclusive)` in
+    /// ascending order. Matching is case-insensitive (line text and
+    /// query compared via `to_lowercase`) and per physical line:
+    /// matches do NOT span wrapped continuations onto the next row.
+    /// Spacer cells are skipped while building each line's text and
+    /// match spans map back to cell columns around wide chars (a wide
+    /// head spans two columns). Occurrences are non-overlapping,
+    /// scanned left to right. An empty query returns no matches.
+    /// On the alternate screen the alt grid's rows are the line space.
+    pub fn find_matches(&self, query: &str) -> Vec<(usize, usize, usize)> {
+        if query.is_empty() || self.cols == 0 || self.rows == 0 {
+            return Vec::new();
+        }
+        let lower_query: String = query.chars().flat_map(char::to_lowercase).collect();
+        if lower_query.is_empty() {
+            return Vec::new();
+        }
+        let mut matches = Vec::new();
+        for abs_line in 0..self.total_abs_lines() {
+            // Lowered line text plus, per lowered char, the cell span
+            // (start_col, end_col_exclusive) it came from. Building
+            // char-by-char keeps the map exact even when a lowercase
+            // mapping expands to more than one char.
+            let mut lowered = String::new();
+            let mut char_cols: Vec<(usize, usize)> = Vec::new();
+            for col in 0..self.cols {
+                let Some(cell) = self.get_absolute_cell(col, abs_line) else {
+                    continue;
+                };
+                if cell.flags.contains(CellFlags::WIDE_SPACER) {
+                    continue;
+                }
+                let end_col = if self
+                    .get_absolute_cell(col + 1, abs_line)
+                    .map(|c| c.flags.contains(CellFlags::WIDE_SPACER))
+                    .unwrap_or(false)
+                {
+                    col + 2
+                } else {
+                    col + 1
+                };
+                for lc in cell.ch.to_lowercase() {
+                    lowered.push(lc);
+                    char_cols.push((col, end_col));
+                }
+            }
+            // Non-overlapping scan: resume after each match's end.
+            let mut search_from = 0;
+            while search_from < lowered.len() {
+                let Some(rel) = lowered[search_from..].find(lower_query.as_str()) else {
+                    break;
+                };
+                let start_byte = search_from + rel;
+                let end_byte = start_byte + lower_query.len();
+                let start_char = lowered[..start_byte].chars().count();
+                let end_char = lowered[..end_byte].chars().count();
+                if end_char > start_char && end_char <= char_cols.len() {
+                    matches.push((abs_line, char_cols[start_char].0, char_cols[end_char - 1].1));
+                }
+                search_from = end_byte;
+            }
+        }
+        matches
+    }
+
+    /// Scroll so `abs_line` becomes visible: at the top viewport row
+    /// for a scrollback line, and with the offset clamped to 0 (line
+    /// already on screen) for a live-grid line. Out-of-range lines
+    /// clamp. No-op on the alternate screen, whose every row is
+    /// already visible (the offset is ignored there).
+    pub fn scroll_to_absolute_line(&mut self, abs_line: usize) {
+        if self.rows == 0 || self.on_alt {
+            return;
+        }
+        let total = self.scrollback.len() + self.rows;
+        let abs_line = abs_line.min(total.saturating_sub(1));
+        self.scroll_offset = self.scrollback.len().saturating_sub(abs_line);
+    }
+
+    /// Viewport row showing `abs_line` under the current scroll
+    /// offset, or `None` when it is not visible. Inverse of
+    /// `viewport_to_abs_line`.
+    pub fn abs_line_to_viewport_row(&self, abs_line: usize) -> Option<usize> {
+        if self.rows == 0 {
+            return None;
+        }
+        let top = self.viewport_to_abs_line(0);
+        abs_line.checked_sub(top).filter(|row| *row < self.rows)
+    }
 }
 
 #[cfg(test)]
@@ -2739,5 +2842,140 @@ mod tests {
         t.set_hyperlink(Some("https://example.com/0"));
         t.print('y');
         assert_eq!(t.get_cell(1, 0).unwrap().link, 1);
+    }
+
+    #[test]
+    fn find_matches_is_case_insensitive() {
+        let mut t = term(10, 3);
+        print_str(&mut t, "HeLLo");
+        assert_eq!(t.find_matches("hello"), vec![(0, 0, 5)]);
+        assert_eq!(t.find_matches("HELLO"), vec![(0, 0, 5)]);
+        assert_eq!(t.find_matches("ell"), vec![(0, 1, 4)]);
+    }
+
+    #[test]
+    fn find_matches_multiple_on_one_line_correct_cols() {
+        let mut t = term(10, 2);
+        print_str(&mut t, "ab ab ab");
+        assert_eq!(t.find_matches("ab"), vec![(0, 0, 2), (0, 3, 5), (0, 6, 8)]);
+    }
+
+    #[test]
+    fn find_matches_in_scrollback_absolute_lines() {
+        let mut t = term(5, 2);
+        print_str(&mut t, "ab");
+        t.linefeed();
+        print_str(&mut t, "cd");
+        t.linefeed();
+        print_str(&mut t, "ef");
+        assert_eq!(t.scrollback.len(), 1);
+        // "ab" is scrollback line 0; "cd"/"ef" are grid rows 0/1.
+        assert_eq!(t.find_matches("ab"), vec![(0, 0, 2)]);
+        assert_eq!(t.find_matches("cd"), vec![(1, 0, 2)]);
+        assert_eq!(t.find_matches("ef"), vec![(2, 0, 2)]);
+        // Ascending across the whole line space.
+        let mut t = term(6, 2);
+        print_str(&mut t, "xx");
+        t.linefeed();
+        print_str(&mut t, "yyxx");
+        t.linefeed();
+        print_str(&mut t, "xx");
+        assert_eq!(t.find_matches("xx"), vec![(0, 0, 2), (1, 2, 4), (2, 0, 2)]);
+    }
+
+    #[test]
+    fn find_matches_after_wide_char_reports_post_spacer_col() {
+        let mut t = term(10, 2);
+        t.print('a');
+        t.print('\u{754C}'); // wide: head col 1, spacer col 2
+        print_str(&mut t, "xy");
+        assert_eq!(t.find_matches("xy"), vec![(0, 3, 5)]);
+        // The wide char itself spans its spacer.
+        assert_eq!(t.find_matches("\u{754C}"), vec![(0, 1, 3)]);
+        assert_eq!(t.find_matches("\u{754C}x"), vec![(0, 1, 4)]);
+        assert_eq!(t.find_matches("a\u{754C}xy"), vec![(0, 0, 5)]);
+    }
+
+    #[test]
+    fn find_matches_empty_and_absent_query_return_empty() {
+        let mut t = term(10, 2);
+        print_str(&mut t, "hello");
+        assert!(t.find_matches("").is_empty());
+        assert!(t.find_matches("zzz").is_empty());
+        let t = term(0, 0);
+        assert!(t.find_matches("x").is_empty());
+    }
+
+    #[test]
+    fn find_matches_non_overlapping_left_to_right() {
+        let mut t = term(10, 2);
+        print_str(&mut t, "aaa");
+        assert_eq!(t.find_matches("aa"), vec![(0, 0, 2)]);
+        let mut t = term(10, 2);
+        print_str(&mut t, "aaaa");
+        assert_eq!(t.find_matches("aa"), vec![(0, 0, 2), (0, 2, 4)]);
+    }
+
+    #[test]
+    fn find_matches_does_not_span_wrapped_continuation() {
+        let mut t = term(4, 3);
+        print_str(&mut t, "abcdef");
+        // Documented limitation: "cdef" spans the wrap, not found.
+        assert!(t.find_matches("cdef").is_empty());
+        assert_eq!(t.find_matches("abcd"), vec![(0, 0, 4)]);
+        assert_eq!(t.find_matches("ef"), vec![(1, 0, 2)]);
+    }
+
+    #[test]
+    fn find_matches_on_alt_screen_uses_alt_line_space() {
+        let mut t = term(5, 2);
+        print_str(&mut t, "main");
+        t.set_alt_screen_1049(true);
+        t.cursor_goto(0, 0);
+        print_str(&mut t, "hi");
+        assert_eq!(t.find_matches("hi"), vec![(0, 0, 2)]);
+        assert!(t.find_matches("main").is_empty());
+        // Every alt row is visible; scrolling to a line is a no-op.
+        t.scroll_to_absolute_line(0);
+        assert_eq!(t.abs_line_to_viewport_row(0), Some(0));
+        assert_eq!(t.get_viewport_cell(0, 0).unwrap().ch, 'h');
+        t.set_alt_screen_1049(false);
+        assert_eq!(t.find_matches("main"), vec![(0, 0, 4)]);
+    }
+
+    #[test]
+    fn scroll_to_absolute_line_makes_target_visible() {
+        let mut t = term(5, 3);
+        print_str(&mut t, "a1");
+        t.linefeed();
+        print_str(&mut t, "b2");
+        t.linefeed();
+        print_str(&mut t, "c3");
+        t.linefeed();
+        print_str(&mut t, "d4");
+        t.linefeed();
+        print_str(&mut t, "e5");
+        assert_eq!(t.scrollback.len(), 2);
+        // Scrollback line lands on the top viewport row.
+        t.scroll_to_absolute_line(1);
+        assert_eq!(t.scroll_offset(), 1);
+        assert_eq!(t.abs_line_to_viewport_row(1), Some(0));
+        assert_eq!(t.get_viewport_cell(0, 0).unwrap().ch, 'b');
+        assert_eq!(t.get_viewport_cell(1, 0).unwrap().ch, '2');
+        // First scrollback line.
+        t.scroll_to_absolute_line(0);
+        assert_eq!(t.get_viewport_cell(0, 0).unwrap().ch, 'a');
+        // A live-grid line: offset clamps to 0, line visible in place.
+        t.scroll_to_absolute_line(3);
+        assert_eq!(t.scroll_offset(), 0);
+        assert_eq!(t.abs_line_to_viewport_row(3), Some(1));
+        assert_eq!(t.get_viewport_cell(0, 1).unwrap().ch, 'd');
+        // Last line and out-of-range clamp without panic.
+        t.scroll_to_absolute_line(4);
+        assert_eq!(t.get_viewport_cell(0, 2).unwrap().ch, 'e');
+        t.scroll_to_absolute_line(999);
+        assert_eq!(t.scroll_offset(), 0);
+        assert_eq!(t.get_viewport_cell(0, 2).unwrap().ch, 'e');
+        assert_eq!(t.abs_line_to_viewport_row(0), None);
     }
 }

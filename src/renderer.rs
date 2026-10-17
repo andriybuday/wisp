@@ -330,7 +330,16 @@ impl Renderer {
         }
     }
 
-    pub fn render(&mut self, terminal: &Terminal, blink_on: bool) {
+    /// `highlights` are search matches as
+    /// `(viewport_row, start_col, end_col_exclusive)`; the entry at
+    /// `current_highlight` (if any) is the current search match.
+    pub fn render(
+        &mut self,
+        terminal: &Terminal,
+        blink_on: bool,
+        highlights: &[(usize, usize, usize)],
+        current_highlight: Option<usize>,
+    ) {
         let output = match self.surface.get_current_texture() {
             Ok(output) => output,
             Err(wgpu::SurfaceError::Lost) | Err(wgpu::SurfaceError::Outdated) => {
@@ -354,7 +363,7 @@ impl Renderer {
             });
 
         // Build vertices for all visible characters
-        let vertices = self.build_vertices(terminal, blink_on);
+        let vertices = self.build_vertices(terminal, blink_on, highlights, current_highlight);
         let indices = Self::build_indices(vertices.len() / 4);
 
         log::debug!(
@@ -440,7 +449,13 @@ impl Renderer {
         output.present();
     }
 
-    fn build_vertices(&mut self, terminal: &Terminal, blink_on: bool) -> Vec<Vertex> {
+    fn build_vertices(
+        &mut self,
+        terminal: &Terminal,
+        blink_on: bool,
+        highlights: &[(usize, usize, usize)],
+        current_highlight: Option<usize>,
+    ) -> Vec<Vertex> {
         let mut vertices = Vec::new();
 
         let cell_width = self.font_manager.cell_width();
@@ -511,6 +526,25 @@ impl Renderer {
                         bg_color = [0.3, 0.5, 0.7, 1.0];
                     }
 
+                    // Search highlight, applied after selection so it
+                    // wins over the selection background.
+                    let mut is_highlighted = false;
+                    let mut is_current = false;
+                    for (i, &(hrow, start_col, end_col)) in highlights.iter().enumerate() {
+                        if hrow == row && col >= start_col && col < end_col {
+                            if current_highlight == Some(i) {
+                                is_current = true;
+                            } else {
+                                is_highlighted = true;
+                            }
+                        }
+                    }
+                    if is_current {
+                        bg_color = [0.85, 0.45, 0.0, 1.0]; // orange
+                    } else if is_highlighted {
+                        bg_color = [0.45, 0.38, 0.0, 1.0]; // dark yellow
+                    }
+
                     // Shown cursor: it becomes this cell's background, and
                     // the glyph (drawn below, after the background quad)
                     // takes the palette background color so the character
@@ -525,6 +559,8 @@ impl Renderer {
                     if cell.bg != Color::Default
                         || cell.flags.contains(crate::terminal::CellFlags::INVERSE)
                         || is_selected
+                        || is_highlighted
+                        || is_current
                         || is_cursor
                     {
                         // Background quad (using a solid color, no texture)
