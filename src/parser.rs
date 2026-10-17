@@ -872,6 +872,36 @@ mod tests {
     }
 
     #[test]
+    fn wave3_osc8_span_survives_resize_reflow() {
+        // Cross-feature (013 + 011): linked trailing spaces are content,
+        // not reflow filler, and the span remains resolvable after resize.
+        let mut p = run(b"\x1b]8;;https://example.com\x1b\\x   \x1b]8;;\x1b\\y");
+        assert_eq!(
+            p.terminal().hyperlink_at_viewport(3, 0),
+            Some("https://example.com")
+        );
+        p.terminal_mut().resize(4, 4);
+        assert_eq!(
+            p.terminal().hyperlink_at_viewport(3, 0),
+            Some("https://example.com"),
+            "linked trailing spaces must not be trimmed by reflow"
+        );
+        // The unlinked 'y' after the span truncates/wraps without the link.
+        assert_eq!(p.terminal().hyperlink_at_viewport(0, 1), None);
+    }
+
+    #[test]
+    fn wave3_dim_strike_survive_save_restore() {
+        // Cross-feature (012 + 002): DIM/STRIKETHROUGH ride the saved
+        // cursor attributes through ESC 7 / ESC 8.
+        use crate::terminal::CellFlags;
+        let p = run(b"\x1b[2;9mab\x1b7\x1b[0m\x1b[H\x1b8x");
+        let cell = p.terminal().get_cell(2, 0).unwrap();
+        assert!(cell.flags.contains(CellFlags::DIM));
+        assert!(cell.flags.contains(CellFlags::STRIKETHROUGH));
+    }
+
+    #[test]
     fn wave2_all_private_modes_coexist() {
         // Cross-feature (002 + 004 + 007 + 008): every DEC private mode set
         // in one stream applies independently and resets independently.
