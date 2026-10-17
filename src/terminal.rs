@@ -14,6 +14,9 @@ pub struct Cell {
     pub fg: Color,
     pub bg: Color,
     pub flags: CellFlags,
+    /// Interned OSC 8 hyperlink id (index + 1 into the terminal's
+    /// hyperlink table); 0 means no link.
+    pub link: u16,
 }
 
 impl Default for Cell {
@@ -23,6 +26,7 @@ impl Default for Cell {
             fg: Color::Default,
             bg: Color::Default,
             flags: CellFlags::empty(),
+            link: 0,
         }
     }
 }
@@ -104,6 +108,10 @@ pub struct Terminal {
     saved_cursor: (usize, usize, Color, Color, CellFlags),
     /// Cursor saved on entering the alternate screen via ?1049
     alt_entry_cursor: (usize, usize),
+    /// Interned OSC 8 hyperlink URIs; a cell's `link` id is index + 1.
+    hyperlinks: Vec<String>,
+    /// Link id stamped into newly printed cells (0 = no link).
+    current_link: u16,
 }
 
 impl Terminal {
@@ -136,6 +144,8 @@ impl Terminal {
             region_bottom: rows.saturating_sub(1),
             saved_cursor: (0, 0, Color::Default, Color::Default, CellFlags::empty()),
             alt_entry_cursor: (0, 0),
+            hyperlinks: Vec::new(),
+            current_link: 0,
         }
     }
 
@@ -311,6 +321,52 @@ impl Terminal {
         self.title = Some(title);
     }
 
+    /// OSC 8: set (or clear, with `None`/empty/invalid) the hyperlink
+    /// applied to subsequently printed cells. Only `http://`, `https://`,
+    /// and `mailto:` URIs of at most 2048 bytes are accepted; anything
+    /// else clears the link like an empty URI. URIs are deduplicated by
+    /// linear search into a table capped at 1024 entries; beyond the cap
+    /// new links are not interned and text prints without a link.
+    pub fn set_hyperlink(&mut self, uri: Option<&str>) {
+        const MAX_URI_BYTES: usize = 2048;
+        const MAX_HYPERLINKS: usize = 1024;
+        let Some(uri) = uri else {
+            self.current_link = 0;
+            return;
+        };
+        let accepted = !uri.is_empty()
+            && uri.len() <= MAX_URI_BYTES
+            && (uri.starts_with("http://")
+                || uri.starts_with("https://")
+                || uri.starts_with("mailto:"));
+        if !accepted {
+            self.current_link = 0;
+            return;
+        }
+        if let Some(idx) = self.hyperlinks.iter().position(|u| u == uri) {
+            self.current_link = (idx + 1) as u16;
+            return;
+        }
+        if self.hyperlinks.len() >= MAX_HYPERLINKS {
+            self.current_link = 0;
+            return;
+        }
+        self.hyperlinks.push(uri.to_owned());
+        self.current_link = self.hyperlinks.len() as u16;
+    }
+
+    /// Resolve the hyperlink URI of a viewport cell (scroll offset
+    /// honoured via `get_viewport_cell`), if any.
+    pub fn hyperlink_at_viewport(&self, col: usize, row: usize) -> Option<&str> {
+        let cell = self.get_viewport_cell(col, row)?;
+        if cell.link == 0 {
+            return None;
+        }
+        self.hyperlinks
+            .get((cell.link - 1) as usize)
+            .map(|s| s.as_str())
+    }
+
     pub fn rows(&self) -> usize {
         self.rows
     }
@@ -444,6 +500,7 @@ impl Terminal {
             fg: self.current_fg,
             bg: self.current_bg,
             flags: self.current_flags,
+            link: self.current_link,
         };
         let cols = self.cols;
         if width >= 2 && col + 1 < cols {
@@ -1639,5 +1696,122 @@ mod tests {
         t.set_selection_start(0, 0);
         t.set_selection_end(3, 0);
         assert_eq!(t.get_selected_text(), "a\u{754C}b");
+    }
+
+    #[test]
+    fn hyperlink_stamps_cells_and_clears() {
+        let mut t = term(10, 2);
+        print_str(&mut t, "ab");
+        t.set_hyperlink(Some("https://example.com"));
+        print_str(&mut t, "cd");
+        t.set_hyperlink(None);
+        print_str(&mut t, "ef");
+        // Before/after the span: no link. Inside: same non-zero id.
+        assert_eq!(t.get_cell(0, 0).unwrap().link, 0);
+        assert_eq!(t.get_cell(1, 0).unwrap().link, 0);
+        let id = t.get_cell(2, 0).unwrap().link;
+        assert_ne!(id, 0);
+        assert_eq!(t.get_cell(3, 0).unwrap().link, id);
+        assert_eq!(t.get_cell(4, 0).unwrap().link, 0);
+        assert_eq!(t.get_cell(5, 0).unwrap().link, 0);
+        // Empty URI also clears.
+        t.set_hyperlink(Some("https://example.com"));
+        t.set_hyperlink(Some(""));
+        t.print('g');
+        assert_eq!(t.get_cell(6, 0).unwrap().link, 0);
+        assert_eq!(t.hyperlink_at_viewport(2, 0), Some("https://example.com"));
+        assert_eq!(t.hyperlink_at_viewport(0, 0), None);
+        assert_eq!(t.hyperlink_at_viewport(99, 0), None);
+    }
+
+    #[test]
+    fn hyperlink_rejects_dangerous_and_unknown_schemes() {
+        let mut t = term(10, 2);
+        for bad in ["javascript:alert(1)", "file:///etc/passwd", "ftp://x", ""] {
+            t.set_hyperlink(Some("https://example.com"));
+            t.set_hyperlink(Some(bad));
+            t.print('x');
+            // The invalid URI cleared the previous link.
+            let (col, _) = t.cursor();
+            assert_eq!(t.get_cell(col - 1, 0).unwrap().link, 0, "for {bad:?}");
+        }
+        // mailto: is accepted; overlong URIs are not.
+        t.set_hyperlink(Some("mailto:a@example.com"));
+        t.print('m');
+        let (col, _) = t.cursor();
+        assert_ne!(t.get_cell(col - 1, 0).unwrap().link, 0);
+        let long = format!("https://example.com/{}", "a".repeat(2048));
+        t.set_hyperlink(Some(&long));
+        t.print('y');
+        let (col, _) = t.cursor();
+        assert_eq!(t.get_cell(col - 1, 0).unwrap().link, 0);
+    }
+
+    #[test]
+    fn hyperlink_interning_dedupes_and_distinguishes() {
+        let mut t = term(20, 2);
+        t.set_hyperlink(Some("https://a.example"));
+        t.print('a');
+        t.set_hyperlink(Some("https://b.example"));
+        t.print('b');
+        t.set_hyperlink(Some("https://a.example"));
+        t.print('c');
+        let a = t.get_cell(0, 0).unwrap().link;
+        let b = t.get_cell(1, 0).unwrap().link;
+        let c = t.get_cell(2, 0).unwrap().link;
+        assert_ne!(a, 0);
+        assert_ne!(a, b);
+        assert_eq!(a, c);
+    }
+
+    #[test]
+    fn hyperlink_spacer_shares_link_id() {
+        let mut t = term(10, 2);
+        t.set_hyperlink(Some("https://example.com"));
+        t.print('\u{754C}');
+        let head = t.get_cell(0, 0).unwrap();
+        let spacer = t.get_cell(1, 0).unwrap();
+        assert!(spacer.flags.contains(CellFlags::WIDE_SPACER));
+        assert_ne!(head.link, 0);
+        assert_eq!(spacer.link, head.link);
+    }
+
+    #[test]
+    fn hyperlink_at_viewport_resolves_through_scroll_offset() {
+        let mut t = term(10, 2);
+        t.set_hyperlink(Some("https://example.com"));
+        print_str(&mut t, "link");
+        t.set_hyperlink(None);
+        // Push the linked line into scrollback, then scroll up to it.
+        t.linefeed();
+        t.carriage_return();
+        print_str(&mut t, "next");
+        t.linefeed();
+        t.carriage_return();
+        print_str(&mut t, "last");
+        assert_eq!(t.scrollback_len(), 1);
+        assert_eq!(
+            t.hyperlink_at_viewport(0, 0),
+            None,
+            "at bottom the link scrolled away"
+        );
+        t.scroll_viewport_up(1);
+        assert_eq!(t.hyperlink_at_viewport(0, 0), Some("https://example.com"));
+        assert_eq!(t.hyperlink_at_viewport(0, 1), None);
+    }
+
+    #[test]
+    fn hyperlink_table_cap_prints_without_link() {
+        let mut t = term(10, 2);
+        for i in 0..1024 {
+            t.set_hyperlink(Some(&format!("https://example.com/{i}")));
+        }
+        t.set_hyperlink(Some("https://example.com/overflow"));
+        t.print('x');
+        assert_eq!(t.get_cell(0, 0).unwrap().link, 0);
+        // An already-interned URI still resolves at the cap.
+        t.set_hyperlink(Some("https://example.com/0"));
+        t.print('y');
+        assert_eq!(t.get_cell(1, 0).unwrap().link, 1);
     }
 }
