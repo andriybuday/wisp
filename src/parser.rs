@@ -174,7 +174,7 @@ impl Perform for AnsiPerformer {
     fn unhook(&mut self) {}
 
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
-        // OSC 0 / OSC 2: set window title. All other OSC is ignored.
+        // OSC 0 / OSC 2: set window title.
         if (params.first() == Some(&b"0".as_slice()) || params.first() == Some(&b"2".as_slice()))
             && params.len() >= 2
         {
@@ -184,6 +184,17 @@ impl Perform for AnsiPerformer {
                 .take(256)
                 .collect();
             self.terminal.set_title(title);
+        }
+        // OSC 8: hyperlink. Shape is ["8", _params, uri]; an empty URI
+        // ends the link. Malformed shapes are ignored. All other OSC is
+        // ignored.
+        if params.first() == Some(&b"8".as_slice()) && params.len() == 3 {
+            let uri = String::from_utf8_lossy(params[2]);
+            if uri.is_empty() {
+                self.terminal.set_hyperlink(None);
+            } else {
+                self.terminal.set_hyperlink(Some(&uri));
+            }
         }
     }
 
@@ -882,5 +893,49 @@ mod tests {
         assert!(t.cursor_visible());
         assert_eq!(t.mouse_tracking(), MouseTracking::AnyEvent);
         assert!(t.sgr_mouse());
+    }
+
+    #[test]
+    fn osc8_sets_link_and_empty_uri_clears() {
+        // BEL-terminated OSC 8 around "cd"; plain text on both sides.
+        let p = run(b"ab\x1b]8;;https://example.com\x07cd\x1b]8;;\x07ef");
+        let t = p.terminal();
+        assert_eq!(t.get_cell(0, 0).unwrap().link, 0);
+        assert_eq!(t.get_cell(1, 0).unwrap().link, 0);
+        let id = t.get_cell(2, 0).unwrap().link;
+        assert_ne!(id, 0);
+        assert_eq!(t.get_cell(3, 0).unwrap().link, id);
+        assert_eq!(t.get_cell(4, 0).unwrap().link, 0);
+        assert_eq!(t.get_cell(5, 0).unwrap().link, 0);
+        assert_eq!(t.hyperlink_at_viewport(2, 0), Some("https://example.com"));
+        // ST-terminated with an id= param works the same.
+        let p = run(b"\x1b]8;id=x;mailto:a@example.com\x1b\\m\x1b]8;;\x1b\\n");
+        let t = p.terminal();
+        assert_ne!(t.get_cell(0, 0).unwrap().link, 0);
+        assert_eq!(t.hyperlink_at_viewport(0, 0), Some("mailto:a@example.com"));
+        assert_eq!(t.get_cell(1, 0).unwrap().link, 0);
+    }
+
+    #[test]
+    fn osc8_rejects_javascript_and_file_uris() {
+        let p = run(b"\x1b]8;;javascript:alert(1)\x07a\x1b]8;;file:///etc/passwd\x07b");
+        let t = p.terminal();
+        assert_eq!(t.get_cell(0, 0).unwrap().ch, 'a');
+        assert_eq!(t.get_cell(0, 0).unwrap().link, 0);
+        assert_eq!(t.get_cell(1, 0).unwrap().ch, 'b');
+        assert_eq!(t.get_cell(1, 0).unwrap().link, 0);
+        assert_eq!(t.hyperlink_at_viewport(0, 0), None);
+    }
+
+    #[test]
+    fn osc8_malformed_shapes_are_ignored() {
+        // Missing URI param entirely, and an extra param: no link, no panic.
+        let p = run(b"\x1b]8;https://example.com\x07a\x1b]8;;https://example.com;extra\x07b");
+        let t = p.terminal();
+        assert_eq!(t.get_cell(0, 0).unwrap().link, 0);
+        assert_eq!(t.get_cell(1, 0).unwrap().link, 0);
+        // Invalid UTF-8 in the URI decodes lossily and fails validation.
+        let p = run(b"\x1b]8;;\xff\xfe\x07c");
+        assert_eq!(p.terminal().get_cell(0, 0).unwrap().link, 0);
     }
 }

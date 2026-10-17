@@ -684,8 +684,10 @@ impl Renderer {
                         ]);
                     }
 
-                    // Render underline if flag is set
-                    if cell.flags.contains(crate::terminal::CellFlags::UNDERLINE) {
+                    // Render underline if flag is set, or for a hyperlink
+                    // cell (drawn once when both apply).
+                    if cell.flags.contains(crate::terminal::CellFlags::UNDERLINE) || cell.link != 0
+                    {
                         let underline_y_ndc = y_ndc - cell_h_ndc + (2.0 * height_ndc);
                         let underline_h_ndc = 2.0 * height_ndc;
 

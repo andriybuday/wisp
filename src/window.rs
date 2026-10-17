@@ -13,7 +13,7 @@ use crate::input;
 use crate::parser::AnsiParser;
 use crate::pty::PtyManager;
 use crate::renderer::Renderer;
-use crate::terminal::{MouseTracking, Terminal};
+use crate::terminal::{CellFlags, MouseTracking, Terminal};
 
 /// User events delivered to the event loop via `EventLoopProxy`.
 #[derive(Debug)]
@@ -49,6 +49,68 @@ pub struct WispWindow {
     next_blink: Instant,
     /// When the current synchronized-output hold was first observed.
     sync_since: Option<Instant>,
+}
+
+/// Find the `http://`/`https://` URL in `row` covering `byte_index`, if
+/// any. A URL runs from its scheme to the next whitespace (or end of row),
+/// with trailing punctuation in `).,;:!?` trimmed. Bare `www.` text never
+/// matches. Pure function; `byte_index` need not be a char boundary.
+fn find_url_at(row: &str, byte_index: usize) -> Option<&str> {
+    let mut search_from = 0;
+    while search_from < row.len() {
+        let rest = &row[search_from..];
+        let http = rest.find("http://").map(|i| search_from + i);
+        let https = rest.find("https://").map(|i| search_from + i);
+        let start = match (http, https) {
+            (Some(a), Some(b)) => a.min(b),
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+            (None, None) => return None,
+        };
+        let mut end = row.len();
+        for (offset, ch) in row[start..].char_indices() {
+            if ch.is_whitespace() {
+                end = start + offset;
+                break;
+            }
+        }
+        let mut trimmed_end = end;
+        while trimmed_end > start {
+            let last = row[..trimmed_end].chars().next_back()?;
+            if ").,;:!?".contains(last) {
+                trimmed_end -= last.len_utf8();
+            } else {
+                break;
+            }
+        }
+        let url = &row[start..trimmed_end];
+        if byte_index >= start && byte_index < trimmed_end && url != "http://" && url != "https://"
+        {
+            return Some(url);
+        }
+        search_from = end.max(start + 1);
+    }
+    None
+}
+
+/// Open `url` with the platform handler, spawned detached. Errors are
+/// logged and ignored.
+fn open_url(url: &str) {
+    #[cfg(target_os = "macos")]
+    let result = std::process::Command::new("open").arg(url).spawn();
+    #[cfg(target_os = "linux")]
+    let result = std::process::Command::new("xdg-open").arg(url).spawn();
+    #[cfg(target_os = "windows")]
+    let result = std::process::Command::new("cmd")
+        .arg("/C")
+        .arg("start")
+        .arg(url)
+        .spawn();
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    let result = std::process::Command::new("xdg-open").arg(url).spawn();
+    if let Err(e) = result {
+        log::warn!("Failed to open URL {url}: {e}");
+    }
 }
 
 /// Physical (cell width, cell height, padding) for `config` at `scale`.
@@ -344,9 +406,56 @@ impl WispWindow {
         }
     }
 
-    /// Handle mouse press: reported to the app while tracking is active,
-    /// otherwise starts a local (left-button) selection.
+    /// Implicit URL at a viewport cell: build the row's text skipping
+    /// wide-char spacer cells (a clicked spacer maps to its head char),
+    /// then run `find_url_at` for the clicked cell's byte index.
+    fn implicit_url_at(&self, col: usize, row: usize) -> Option<String> {
+        let terminal = self.parser.terminal();
+        let mut text = String::new();
+        let mut clicked_byte: Option<usize> = None;
+        let mut last_byte: Option<usize> = None;
+        for c in 0..terminal.cols() {
+            let cell = terminal.get_viewport_cell(c, row)?;
+            if cell.flags.contains(CellFlags::WIDE_SPACER) {
+                if c == col {
+                    clicked_byte = last_byte;
+                }
+                continue;
+            }
+            let byte = text.len();
+            if c == col {
+                clicked_byte = Some(byte);
+            }
+            last_byte = Some(byte);
+            text.push(cell.ch);
+        }
+        let byte_index = clicked_byte?;
+        find_url_at(&text, byte_index).map(|s| s.to_owned())
+    }
+
+    /// Handle mouse press: a Super/Ctrl left-click on a hyperlink (explicit
+    /// OSC 8 first, then implicit URL detection) opens it and is consumed;
+    /// otherwise reported to the app while tracking is active, or starts a
+    /// local (left-button) selection.
     pub fn mouse_press(&mut self, button: MouseButton, modifiers: ModifiersState) {
+        if button == MouseButton::Left && (modifiers.super_key() || modifiers.control_key()) {
+            if let Some((col, row)) = self
+                .last_mouse_position
+                .and_then(|pos| self.position_to_grid(pos))
+            {
+                let url = self
+                    .parser
+                    .terminal()
+                    .hyperlink_at_viewport(col, row)
+                    .map(|s| s.to_owned())
+                    .or_else(|| self.implicit_url_at(col, row));
+                if let Some(url) = url {
+                    open_url(&url);
+                    return;
+                }
+            }
+        }
+
         if self.mouse_reporting_active(modifiers) {
             if let (Some(base), Some((col, row))) =
                 (input::mouse_button_base(button), self.report_cell())
@@ -525,5 +634,88 @@ impl WispWindow {
         .min(max_row);
 
         (col, row)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn find_url_at_start_middle_and_end() {
+        // URL at the start of the row.
+        let row = "https://example.com rest";
+        assert_eq!(find_url_at(row, 0), Some("https://example.com"));
+        assert_eq!(find_url_at(row, 10), Some("https://example.com"));
+        assert_eq!(find_url_at(row, 18), Some("https://example.com"));
+        // URL in the middle.
+        let row = "see http://a.example/c here";
+        assert_eq!(find_url_at(row, 4), Some("http://a.example/c"));
+        assert_eq!(find_url_at(row, 12), Some("http://a.example/c"));
+        assert_eq!(find_url_at(row, 21), Some("http://a.example/c"));
+        // URL at the end.
+        let row = "go to https://example.com";
+        assert_eq!(find_url_at(row, 6), Some("https://example.com"));
+        assert_eq!(find_url_at(row, row.len() - 1), Some("https://example.com"));
+        // Whole row is one http URL.
+        assert_eq!(
+            find_url_at("http://example.com", 5),
+            Some("http://example.com")
+        );
+        // Second URL in a row is found at its own position.
+        let row = "http://a.example and https://b.example";
+        assert_eq!(find_url_at(row, 2), Some("http://a.example"));
+        assert_eq!(find_url_at(row, 25), Some("https://b.example"));
+    }
+
+    #[test]
+    fn find_url_at_none_outside_url() {
+        let row = "see https://example.com here";
+        assert_eq!(find_url_at(row, 0), None);
+        assert_eq!(find_url_at(row, 3), None, "space before the URL");
+        assert_eq!(find_url_at(row, 23), None, "space after the URL");
+        assert_eq!(find_url_at(row, 27), None);
+        assert_eq!(find_url_at("no urls at all", 5), None);
+        assert_eq!(find_url_at("", 0), None);
+        assert_eq!(find_url_at("https://example.com", 100), None);
+        assert_eq!(
+            find_url_at("https://example.com", 19),
+            None,
+            "one past the last byte is not covered"
+        );
+    }
+
+    #[test]
+    fn find_url_at_trims_trailing_punctuation() {
+        for (row, expected) in [
+            ("(https://example.com)", "https://example.com"),
+            ("see https://example.com.", "https://example.com"),
+            ("see https://example.com, ok", "https://example.com"),
+            ("see https://example.com; ok", "https://example.com"),
+            ("see https://example.com:", "https://example.com"),
+            ("is https://example.com?", "https://example.com"),
+            ("wow https://example.com!", "https://example.com"),
+            ("(see https://example.com/a).,", "https://example.com/a"),
+        ] {
+            // Click on the 'e' of "example" in every row.
+            let idx = row.find("example").unwrap();
+            assert_eq!(find_url_at(row, idx), Some(expected), "for {row:?}");
+        }
+        // Clicking the trimmed punctuation itself is outside the URL.
+        assert_eq!(find_url_at("(https://example.com)", 20), None);
+        // Inner punctuation is kept.
+        assert_eq!(
+            find_url_at("https://example.com/a,b;c", 5),
+            Some("https://example.com/a,b;c")
+        );
+    }
+
+    #[test]
+    fn find_url_at_ignores_bare_www() {
+        assert_eq!(find_url_at("www.example.com", 0), None);
+        assert_eq!(find_url_at("visit www.example.com today", 8), None);
+        assert_eq!(find_url_at("visit www.example.com today", 15), None);
+        // A bare scheme with nothing after it is not a URL either.
+        assert_eq!(find_url_at("broken http:// link", 8), None);
     }
 }
