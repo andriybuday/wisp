@@ -70,8 +70,8 @@ pub struct Terminal {
     rows: usize,
     /// Cursor position (col, row)
     cursor: (usize, usize),
-    /// Scrollback buffer
-    scrollback: Vec<Vec<Cell>>,
+    /// Scrollback buffer; each entry carries the row's wrapped flag.
+    scrollback: Vec<(Vec<Cell>, bool)>,
     scrollback_limit: usize,
     /// Current foreground color
     current_fg: Color,
@@ -114,6 +114,12 @@ pub struct Terminal {
     hyperlinks: Vec<String>,
     /// Link id stamped into newly printed cells (0 = no link).
     current_link: u16,
+    /// Deferred wrap: last cell written, wrap on next printable.
+    pending_wrap: bool,
+    /// Per-row continuation flags for the main grid.
+    wrapped: Vec<bool>,
+    /// Per-row continuation flags for the alternate grid.
+    alt_wrapped: Vec<bool>,
 }
 
 impl Terminal {
@@ -148,6 +154,9 @@ impl Terminal {
             alt_entry_cursor: (0, 0),
             hyperlinks: Vec::new(),
             current_link: 0,
+            pending_wrap: false,
+            wrapped: vec![false; rows],
+            alt_wrapped: vec![false; rows],
         }
     }
 
@@ -176,6 +185,30 @@ impl Terminal {
         }
     }
 
+    #[allow(dead_code)] // used by tests; renderer adoption later
+    fn active_wrapped(&self) -> &Vec<bool> {
+        if self.on_alt {
+            &self.alt_wrapped
+        } else {
+            &self.wrapped
+        }
+    }
+
+    fn active_wrapped_mut(&mut self) -> &mut Vec<bool> {
+        if self.on_alt {
+            &mut self.alt_wrapped
+        } else {
+            &mut self.wrapped
+        }
+    }
+
+    fn set_wrapped(&mut self, row: usize, value: bool) {
+        let flags = self.active_wrapped_mut();
+        if row < flags.len() {
+            flags[row] = value;
+        }
+    }
+
     // Used by tests; renderer adoption comes later.
     #[allow(dead_code)]
     pub fn on_alternate_screen(&self) -> bool {
@@ -185,12 +218,16 @@ impl Terminal {
     /// DECSET/DECRST ?1049: enter saves cursor, switches and clears alt;
     /// exit switches back and restores cursor.
     pub fn set_alt_screen_1049(&mut self, enabled: bool) {
+        self.pending_wrap = false;
         if enabled {
             if !self.on_alt {
                 self.alt_entry_cursor = self.cursor;
                 self.on_alt = true;
                 for cell in &mut self.alt_grid {
                     *cell = Cell::default();
+                }
+                for flag in &mut self.alt_wrapped {
+                    *flag = false;
                 }
             }
         } else if self.on_alt {
@@ -204,17 +241,22 @@ impl Terminal {
 
     /// DECSET/DECRST ?47: switch buffers, no cursor save, no clear.
     pub fn set_alt_screen_47(&mut self, enabled: bool) {
+        self.pending_wrap = false;
         self.on_alt = enabled;
     }
 
     /// DECSET/DECRST ?1047: switch buffers, no cursor save; entering does
     /// not clear, leaving clears the alternate grid.
     pub fn set_alt_screen_1047(&mut self, enabled: bool) {
+        self.pending_wrap = false;
         if enabled {
             self.on_alt = true;
         } else {
             for cell in &mut self.alt_grid {
                 *cell = Cell::default();
+            }
+            for flag in &mut self.alt_wrapped {
+                *flag = false;
             }
             self.on_alt = false;
         }
@@ -239,6 +281,7 @@ impl Terminal {
             self.region_bottom = b - 1;
         }
         self.cursor = (0, 0);
+        self.pending_wrap = false;
     }
 
     pub fn save_cursor(&mut self) {
@@ -260,6 +303,7 @@ impl Terminal {
         self.current_fg = fg;
         self.current_bg = bg;
         self.current_flags = flags;
+        self.pending_wrap = false;
     }
 
     pub fn cols(&self) -> usize {
@@ -386,37 +430,200 @@ impl Terminal {
     }
 
     pub fn resize(&mut self, new_cols: usize, new_rows: usize) {
-        fn resized(
-            old: &[Cell],
-            old_cols: usize,
-            old_rows: usize,
-            new_cols: usize,
-            new_rows: usize,
-        ) -> Vec<Cell> {
-            let mut new_grid = vec![Cell::default(); new_cols * new_rows];
-            let copy_cols = old_cols.min(new_cols);
-            let copy_rows = old_rows.min(new_rows);
-            for row in 0..copy_rows {
-                for col in 0..copy_cols {
-                    new_grid[row * new_cols + col] = old[row * old_cols + col];
-                }
-            }
-            new_grid
+        fn is_filler(cell: &Cell) -> bool {
+            // Link-carrying blanks are content, not filler: trimming them
+            // would shorten an OSC 8 span's trailing spaces on resize.
+            cell.ch == ' ' && cell.bg == Color::Default && cell.flags.is_empty() && cell.link == 0
         }
 
-        self.grid = resized(&self.grid, self.cols, self.rows, new_cols, new_rows);
-        self.alt_grid = resized(&self.alt_grid, self.cols, self.rows, new_cols, new_rows);
+        // Join physical rows into logical lines, trimming trailing
+        // blank filler. Spacers (non-empty flags) stay with their char.
+        fn logical_lines(physical: &[(Vec<Cell>, bool)]) -> Vec<Vec<Cell>> {
+            let mut lines: Vec<Vec<Cell>> = Vec::new();
+            for (cells, wrapped) in physical {
+                if *wrapped && !lines.is_empty() {
+                    lines.last_mut().unwrap().extend_from_slice(cells);
+                } else {
+                    lines.push(cells.clone());
+                }
+            }
+            for line in &mut lines {
+                while line.last().map(is_filler).unwrap_or(false) {
+                    line.pop();
+                }
+            }
+            lines
+        }
+
+        // Re-chunk one logical line; never split a wide/spacer pair: the
+        // pair moves to the next chunk and the gap gets a blank pad.
+        fn chunk(line: &[Cell], new_cols: usize) -> Vec<(Vec<Cell>, bool)> {
+            let mut out: Vec<Vec<Cell>> = Vec::new();
+            let mut cur: Vec<Cell> = Vec::new();
+            let flush = |out: &mut Vec<Vec<Cell>>, cur: &mut Vec<Cell>| {
+                while cur.len() < new_cols {
+                    cur.push(Cell::default());
+                }
+                out.push(std::mem::take(cur));
+            };
+            let mut i = 0;
+            while i < line.len() {
+                let wide = i + 1 < line.len()
+                    && line[i + 1].flags.contains(CellFlags::WIDE_SPACER)
+                    && !line[i].flags.contains(CellFlags::WIDE_SPACER);
+                if wide && new_cols >= 2 {
+                    if cur.len() + 2 > new_cols {
+                        flush(&mut out, &mut cur);
+                    }
+                    cur.push(line[i]);
+                    cur.push(line[i + 1]);
+                    i += 2;
+                } else if wide {
+                    // Degenerate 1-column target: keep head only.
+                    if !cur.is_empty() {
+                        flush(&mut out, &mut cur);
+                    }
+                    let mut head = line[i];
+                    head.flags.remove(CellFlags::WIDE_SPACER);
+                    cur.push(head);
+                    i += 2;
+                } else {
+                    if cur.len() >= new_cols {
+                        flush(&mut out, &mut cur);
+                    }
+                    cur.push(line[i]);
+                    i += 1;
+                }
+            }
+            flush(&mut out, &mut cur);
+            out.into_iter()
+                .enumerate()
+                .map(|(idx, cells)| (cells, idx > 0))
+                .collect()
+        }
+
+        // Reflow joined logical lines. `keep_up_to` bounds retained
+        // lines; trailing blanks past it are free space. Returns
+        // (physical rows, first physical row index per logical line).
+        fn reflow(
+            physical: &[(Vec<Cell>, bool)],
+            keep_up_to: Option<usize>,
+            new_cols: usize,
+        ) -> (Vec<(Vec<Cell>, bool)>, Vec<usize>) {
+            let mut lines = logical_lines(physical);
+            let mut last = lines.iter().rposition(|l| !l.is_empty()).unwrap_or(0);
+            if let Some(k) = keep_up_to {
+                last = last.max(k.min(lines.len().saturating_sub(1)));
+            }
+            if lines.is_empty() {
+                lines.push(Vec::new());
+                last = 0;
+            }
+            lines.truncate(last + 1);
+            let mut rows = Vec::new();
+            let mut firsts = Vec::new();
+            for line in &lines {
+                firsts.push(rows.len());
+                rows.extend(chunk(line, new_cols));
+            }
+            (rows, firsts)
+        }
+
+        if new_cols == 0 || new_rows == 0 || self.cols == 0 || self.rows == 0 {
+            self.pending_wrap = false;
+            return;
+        }
+        let old_cols = self.cols;
+        let grid_rows = |g: &[Cell], w: &[bool], rows: usize| -> Vec<(Vec<Cell>, bool)> {
+            (0..rows)
+                .map(|r| {
+                    (
+                        g[r * old_cols..(r + 1) * old_cols].to_vec(),
+                        w.get(r).copied().unwrap_or(false),
+                    )
+                })
+                .collect()
+        };
+
+        // Locate the cursor's logical line and cell offset (active grid).
+        let locate = |physical: &[(Vec<Cell>, bool)], phys_idx: usize, col: usize| {
+            let mut start = phys_idx.min(physical.len().saturating_sub(1));
+            while start > 0 && physical[start].1 {
+                start -= 1;
+            }
+            // Count of logical-line starts before `start`.
+            let logical_idx = physical[..start]
+                .iter()
+                .enumerate()
+                .filter(|(i, (_, w))| *i == 0 || !*w)
+                .count();
+            let offset = (phys_idx - start) * old_cols + col;
+            (logical_idx, offset)
+        };
+
+        // Main grid, with scrollback prepended.
+        let main_phys: Vec<(Vec<Cell>, bool)> = self
+            .scrollback
+            .iter()
+            .cloned()
+            .chain(grid_rows(&self.grid, &self.wrapped, self.rows))
+            .collect();
+        let alt_phys = grid_rows(&self.alt_grid, &self.alt_wrapped, self.rows);
+        let (active_phys, active_idx) = if self.on_alt {
+            (&alt_phys, self.cursor.1)
+        } else {
+            (&main_phys, self.scrollback.len() + self.cursor.1)
+        };
+        let (cur_logical, cur_offset) = locate(active_phys, active_idx, self.cursor.0);
+
+        let (main_rows, main_firsts) = reflow(
+            &main_phys,
+            if self.on_alt { None } else { Some(cur_logical) },
+            new_cols,
+        );
+        let (alt_rows, alt_firsts) = reflow(
+            &alt_phys,
+            if self.on_alt { Some(cur_logical) } else { None },
+            new_cols,
+        );
+
+        let take_grid = |rows: &[(Vec<Cell>, bool)]| -> (Vec<Cell>, Vec<bool>, usize) {
+            let start = rows.len().saturating_sub(new_rows);
+            let mut g = vec![Cell::default(); new_cols * new_rows];
+            let mut w = vec![false; new_rows];
+            for (ri, (cells, wrapped)) in rows[start..].iter().enumerate() {
+                g[ri * new_cols..(ri + 1) * new_cols].copy_from_slice(&cells[..new_cols]);
+                w[ri] = *wrapped;
+            }
+            (g, w, start)
+        };
+        let (new_grid, new_wrapped, main_start) = take_grid(&main_rows);
+        let (new_alt, new_alt_wrapped, alt_start) = take_grid(&alt_rows);
+        let mut overflow: Vec<(Vec<Cell>, bool)> = main_rows[..main_start].to_vec();
+        if overflow.len() > self.scrollback_limit {
+            overflow.drain(..overflow.len() - self.scrollback_limit);
+        }
+        let (firsts, start) = if self.on_alt {
+            (&alt_firsts, alt_start)
+        } else {
+            (&main_firsts, main_start)
+        };
+        let first = firsts.get(cur_logical).copied().unwrap_or(0);
+        let abs_row = first + cur_offset / new_cols;
+        let grid_row = abs_row.saturating_sub(start).min(new_rows - 1);
+        self.scrollback = overflow;
+        self.grid = new_grid;
+        self.wrapped = new_wrapped;
+        self.alt_grid = new_alt;
+        self.alt_wrapped = new_alt_wrapped;
         self.cols = new_cols;
         self.rows = new_rows;
-
-        // Adjust cursor position
-        self.cursor.0 = self.cursor.0.min(new_cols.saturating_sub(1));
-        self.cursor.1 = self.cursor.1.min(new_rows.saturating_sub(1));
-
-        // Clamp the scroll region to the new height
-        let last = new_rows.saturating_sub(1);
-        self.region_bottom = self.region_bottom.min(last);
-        self.region_top = self.region_top.min(self.region_bottom);
+        self.cursor = ((cur_offset % new_cols).min(new_cols - 1), grid_row);
+        self.region_top = 0;
+        self.region_bottom = new_rows - 1;
+        self.scroll_offset = 0;
+        self.pending_wrap = false;
+        self.selection = None;
     }
 
     pub fn get_cell(&self, col: usize, row: usize) -> Option<&Cell> {
@@ -468,6 +675,19 @@ impl Terminal {
         }
     }
 
+    /// The wrap path: linefeed, marking the destination row wrapped.
+    fn wrap_to_next_line(&mut self) {
+        self.pending_wrap = false;
+        let before = self.cursor.1;
+        let scrolled = before == self.region_bottom;
+        self.index();
+        self.cursor.0 = 0;
+        if scrolled || self.cursor.1 != before {
+            let row = self.cursor.1;
+            self.set_wrapped(row, true);
+        }
+    }
+
     pub fn print(&mut self, ch: char) {
         use unicode_width::UnicodeWidthChar;
 
@@ -486,10 +706,12 @@ impl Terminal {
             return;
         }
 
-        // A wide char cannot fit in the last column: wrap first, using
-        // the same linefeed path as an ordinary end-of-line wrap.
-        if width >= 2 && self.cols >= 2 && self.cursor.0 == self.cols - 1 {
-            self.linefeed();
+        // Deferred wrap: the next printable performs the wrap first.
+        if self.pending_wrap {
+            self.wrap_to_next_line();
+        } else if width >= 2 && self.cols >= 2 && self.cursor.0 == self.cols - 1 {
+            // A wide char cannot fit in the last column: wrap first.
+            self.wrap_to_next_line();
         }
 
         let (col, row) = self.cursor;
@@ -518,21 +740,28 @@ impl Terminal {
             let grid = self.active_grid_mut();
             grid[row * cols + col] = cell;
             grid[row * cols + col + 1] = spacer;
-            self.cursor.0 += 2;
+            if col + 1 == cols - 1 {
+                self.cursor.0 = cols - 1;
+                self.pending_wrap = true;
+            } else {
+                self.cursor.0 += 2;
+            }
         } else {
-            // Width 1 exactly as before (also the degenerate 1-column
-            // fallback for a wide char, which has no room for a spacer).
+            // Width 1 (also the degenerate 1-column fallback for a
+            // wide char, which has no room for a spacer).
             self.blank_wide_neighbor(col, row);
             self.active_grid_mut()[row * cols + col] = cell;
-            self.cursor.0 += 1;
-        }
-        if self.cursor.0 >= self.cols {
-            self.linefeed();
+            if col == cols - 1 {
+                self.pending_wrap = true;
+            } else {
+                self.cursor.0 += 1;
+            }
         }
     }
 
     /// ESC D (IND): move down, scrolling the region at the bottom margin.
     pub fn index(&mut self) {
+        self.pending_wrap = false;
         if self.cursor.1 == self.region_bottom {
             self.scroll_region_up(1);
         } else if self.cursor.1 < self.rows.saturating_sub(1) {
@@ -542,6 +771,7 @@ impl Terminal {
 
     /// ESC M (RI): move up, scrolling the region at the top margin.
     pub fn reverse_index(&mut self) {
+        self.pending_wrap = false;
         if self.cursor.1 == self.region_top {
             self.scroll_region_down(1);
         } else {
@@ -551,26 +781,31 @@ impl Terminal {
 
     /// ESC E (NEL): carriage return + index.
     pub fn next_line(&mut self) {
+        self.pending_wrap = false;
         self.cursor.0 = 0;
         self.index();
     }
 
     pub fn linefeed(&mut self) {
+        self.pending_wrap = false;
         self.index();
         self.cursor.0 = 0;
     }
 
     pub fn carriage_return(&mut self) {
+        self.pending_wrap = false;
         self.cursor.0 = 0;
     }
 
     pub fn backspace(&mut self) {
+        self.pending_wrap = false;
         if self.cursor.0 > 0 {
             self.cursor.0 -= 1;
         }
     }
 
     pub fn tab(&mut self) {
+        self.pending_wrap = false;
         self.cursor.0 = ((self.cursor.0 / 8) + 1) * 8;
         if self.cursor.0 >= self.cols {
             self.linefeed();
@@ -578,33 +813,40 @@ impl Terminal {
     }
 
     pub fn cursor_up(&mut self, n: usize) {
+        self.pending_wrap = false;
         self.cursor.1 = self.cursor.1.saturating_sub(n);
     }
 
     pub fn cursor_down(&mut self, n: usize) {
+        self.pending_wrap = false;
         self.cursor.1 = (self.cursor.1 + n).min(self.rows - 1);
     }
 
     pub fn cursor_forward(&mut self, n: usize) {
+        self.pending_wrap = false;
         self.cursor.0 = (self.cursor.0 + n).min(self.cols - 1);
     }
 
     pub fn cursor_backward(&mut self, n: usize) {
+        self.pending_wrap = false;
         self.cursor.0 = self.cursor.0.saturating_sub(n);
     }
 
     pub fn cursor_goto(&mut self, col: usize, row: usize) {
+        self.pending_wrap = false;
         self.cursor.0 = col.min(self.cols.saturating_sub(1));
         self.cursor.1 = row.min(self.rows.saturating_sub(1));
     }
 
     /// CSI G (CHA): move to absolute column (0-based).
     pub fn cursor_to_column(&mut self, col: usize) {
+        self.pending_wrap = false;
         self.cursor.0 = col.min(self.cols.saturating_sub(1));
     }
 
     /// CSI d (VPA): move to absolute row (0-based).
     pub fn cursor_to_row(&mut self, row: usize) {
+        self.pending_wrap = false;
         self.cursor.1 = row.min(self.rows.saturating_sub(1));
     }
 
@@ -621,12 +863,17 @@ impl Terminal {
     }
 
     pub fn clear_all(&mut self) {
+        self.pending_wrap = false;
         for cell in self.active_grid_mut().iter_mut() {
             *cell = Cell::default();
+        }
+        for flag in self.active_wrapped_mut().iter_mut() {
+            *flag = false;
         }
     }
 
     pub fn clear_below(&mut self) {
+        self.pending_wrap = false;
         let (col, row) = self.cursor;
         let cols = self.cols;
         let rows = self.rows;
@@ -639,9 +886,14 @@ impl Terminal {
                 grid[r * cols + c] = Cell::default();
             }
         }
+        let flags = self.active_wrapped_mut();
+        if row + 1 < flags.len() {
+            flags[(row + 1)..].fill(false);
+        }
     }
 
     pub fn clear_above(&mut self) {
+        self.pending_wrap = false;
         let (col, row) = self.cursor;
         let cols = self.cols;
         let grid = self.active_grid_mut();
@@ -653,18 +905,28 @@ impl Terminal {
         for c in 0..=col.min(cols.saturating_sub(1)) {
             grid[row * cols + c] = Cell::default();
         }
-    }
-
-    pub fn clear_line(&mut self) {
-        let row = self.cursor.1;
-        let cols = self.cols;
-        let grid = self.active_grid_mut();
-        for c in 0..cols {
-            grid[row * cols + c] = Cell::default();
+        let flags = self.active_wrapped_mut();
+        let n = row.min(flags.len());
+        for f in flags.iter_mut().take(n) {
+            *f = false;
         }
     }
 
+    pub fn clear_line(&mut self) {
+        self.pending_wrap = false;
+        let row = self.cursor.1;
+        let cols = self.cols;
+        {
+            let grid = self.active_grid_mut();
+            for c in 0..cols {
+                grid[row * cols + c] = Cell::default();
+            }
+        }
+        self.set_wrapped(row, false);
+    }
+
     pub fn clear_line_right(&mut self) {
+        self.pending_wrap = false;
         let (col, row) = self.cursor;
         let cols = self.cols;
         let grid = self.active_grid_mut();
@@ -674,6 +936,7 @@ impl Terminal {
     }
 
     pub fn clear_line_left(&mut self) {
+        self.pending_wrap = false;
         let (col, row) = self.cursor;
         let cols = self.cols;
         let grid = self.active_grid_mut();
@@ -741,7 +1004,8 @@ impl Terminal {
             for i in 0..n {
                 let top = self.region_top + i;
                 let line: Vec<Cell> = self.grid[top * self.cols..(top + 1) * self.cols].to_vec();
-                self.scrollback.push(line);
+                let flag = self.wrapped.get(top).copied().unwrap_or(false);
+                self.scrollback.push((line, flag));
                 if self.scrollback.len() > self.scrollback_limit {
                     self.scrollback.remove(0);
                 }
@@ -760,6 +1024,15 @@ impl Terminal {
             for col in 0..cols {
                 grid[row * cols + col] = Cell::default();
             }
+        }
+        let flags = self.active_wrapped_mut();
+        if flags.len() > bottom {
+            if n < bottom + 1 - top {
+                for row in top..=(bottom - n) {
+                    flags[row] = flags[row + n];
+                }
+            }
+            flags[(bottom + 1 - n)..=bottom].fill(false);
         }
     }
 
@@ -781,20 +1054,30 @@ impl Terminal {
                 grid[row * cols + col] = Cell::default();
             }
         }
+        let flags = self.active_wrapped_mut();
+        if flags.len() > bottom {
+            for row in ((top + n)..=bottom).rev() {
+                flags[row] = flags[row - n];
+            }
+            flags[top..(top + n)].fill(false);
+        }
     }
 
     /// CSI S (SU): scroll the region up n lines.
     pub fn csi_scroll_up(&mut self, n: usize) {
+        self.pending_wrap = false;
         self.scroll_region_up(n);
     }
 
     /// CSI T (SD): scroll the region down n lines.
     pub fn csi_scroll_down(&mut self, n: usize) {
+        self.pending_wrap = false;
         self.scroll_region_down(n);
     }
 
     /// CSI L (IL): insert n blank lines at the cursor row (region-aware).
     pub fn insert_lines(&mut self, n: usize) {
+        self.pending_wrap = false;
         let row = self.cursor.1;
         if row < self.region_top || row > self.region_bottom {
             return;
@@ -815,10 +1098,18 @@ impl Terminal {
                 grid[r * cols + col] = Cell::default();
             }
         }
+        let flags = self.active_wrapped_mut();
+        if flags.len() > bottom {
+            for r in ((row + n)..=bottom).rev() {
+                flags[r] = flags[r - n];
+            }
+            flags[row..(row + n)].fill(false);
+        }
     }
 
     /// CSI M (DL): delete n lines at the cursor row (region-aware).
     pub fn delete_lines(&mut self, n: usize) {
+        self.pending_wrap = false;
         let row = self.cursor.1;
         if row < self.region_top || row > self.region_bottom {
             return;
@@ -841,10 +1132,20 @@ impl Terminal {
                 grid[r * cols + col] = Cell::default();
             }
         }
+        let flags = self.active_wrapped_mut();
+        if flags.len() > bottom {
+            if n < bottom + 1 - row {
+                for r in row..=(bottom - n) {
+                    flags[r] = flags[r + n];
+                }
+            }
+            flags[(bottom + 1 - n)..=bottom].fill(false);
+        }
     }
 
     /// CSI @ (ICH): insert n blank chars at the cursor, shifting right.
     pub fn insert_chars(&mut self, n: usize) {
+        self.pending_wrap = false;
         let (col, row) = self.cursor;
         if col >= self.cols || row >= self.rows {
             return;
@@ -865,6 +1166,7 @@ impl Terminal {
 
     /// CSI P (DCH): delete n chars at the cursor, shifting left.
     pub fn delete_chars(&mut self, n: usize) {
+        self.pending_wrap = false;
         let (col, row) = self.cursor;
         if col >= self.cols || row >= self.rows {
             return;
@@ -885,6 +1187,7 @@ impl Terminal {
 
     /// CSI X (ECH): erase n chars starting at the cursor.
     pub fn erase_chars(&mut self, n: usize) {
+        self.pending_wrap = false;
         let (col, row) = self.cursor;
         if col >= self.cols || row >= self.rows {
             return;
@@ -987,7 +1290,7 @@ impl Terminal {
                 // Get from scrollback
                 self.scrollback
                     .get(absolute_row)
-                    .and_then(|line| line.get(col))
+                    .and_then(|line| line.0.get(col))
             } else {
                 // Get from main grid
                 let grid_row = absolute_row - self.scrollback.len();
@@ -1079,11 +1382,17 @@ mod tests {
 
     #[test]
     fn print_wraps_at_last_column() {
+        // Deferred wrap: filling the row leaves the cursor on the
+        // last cell; the next printable performs the wrap.
         let mut t = term(3, 3);
-        print_str(&mut t, "abcd");
+        print_str(&mut t, "abc");
+        assert_eq!(t.cursor(), (2, 0));
+        assert!(t.pending_wrap);
+        t.print('d');
         assert_eq!(t.get_cell(2, 0).unwrap().ch, 'c');
         assert_eq!(t.get_cell(0, 1).unwrap().ch, 'd');
         assert_eq!(t.cursor(), (1, 1));
+        assert!(!t.pending_wrap);
     }
 
     #[test]
@@ -1097,7 +1406,7 @@ mod tests {
         assert_eq!(t.get_cell(0, 1).unwrap().ch, ' ');
         assert_eq!(t.cursor(), (0, 1));
         assert_eq!(t.scrollback.len(), 1);
-        assert_eq!(t.scrollback[0][0].ch, 'a');
+        assert_eq!(t.scrollback[0].0[0].ch, 'a');
     }
 
     #[test]
@@ -1119,11 +1428,11 @@ mod tests {
             t.linefeed();
         }
         assert!(t.scrollback.len() > 2);
-        let newest = t.scrollback.last().unwrap()[0].ch;
+        let newest = t.scrollback.last().unwrap().0[0].ch;
         t.set_scrollback_limit(2);
         assert_eq!(t.scrollback_limit, 2);
         assert_eq!(t.scrollback.len(), 2);
-        assert_eq!(t.scrollback.last().unwrap()[0].ch, newest); // oldest dropped
+        assert_eq!(t.scrollback.last().unwrap().0[0].ch, newest); // oldest dropped
         t.set_scrollback_limit(10);
         assert_eq!(t.scrollback.len(), 2); // raising the cap keeps content
     }
@@ -1593,7 +1902,8 @@ mod tests {
         t.cursor_goto(0, 0);
         print_str(&mut t, "alt");
         t.resize(3, 3);
-        assert_eq!(t.scroll_region(), (1, 2));
+        // 011: resize resets the scroll region to the full screen.
+        assert_eq!(t.scroll_region(), (0, 2));
         assert_eq!(t.get_cell(0, 0).unwrap().ch, 'a');
         assert!(t.get_cell(0, 4).is_none());
     }
@@ -1655,9 +1965,10 @@ mod tests {
     }
 
     #[test]
-    fn wide_char_filling_line_end_wraps_cursor_immediately() {
-        // Immediate wrap (not deferred): filling the last two columns
-        // moves the cursor to the next line start right away.
+    fn wide_char_filling_line_end_sets_pending_wrap() {
+        // Deferred wrap (011, replaces immediate-wrap): a wide char
+        // ending exactly at the edge leaves the cursor on its spacer
+        // cell with a pending wrap; the next printable wraps first.
         let mut t = term(4, 3);
         t.cursor_goto(2, 0);
         t.print('\u{754C}');
@@ -1667,7 +1978,11 @@ mod tests {
             .unwrap()
             .flags
             .contains(CellFlags::WIDE_SPACER));
-        assert_eq!(t.cursor(), (0, 1));
+        assert_eq!(t.cursor(), (3, 0));
+        assert!(t.pending_wrap);
+        t.print('a');
+        assert_eq!(t.get_cell(0, 1).unwrap().ch, 'a');
+        assert_eq!(t.cursor(), (1, 1));
     }
 
     #[test]
@@ -1735,6 +2050,219 @@ mod tests {
         assert!(t.sync_output());
         t.set_sync_output(false);
         assert!(!t.sync_output());
+    }
+
+    fn row_str(t: &Terminal, row: usize) -> String {
+        (0..t.cols())
+            .filter_map(|c| t.get_cell(c, row))
+            .filter(|cell| !cell.flags.contains(CellFlags::WIDE_SPACER))
+            .map(|cell| cell.ch)
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    fn all_text(t: &Terminal) -> String {
+        let mut s = String::new();
+        for (cells, _) in &t.scrollback {
+            for cell in cells {
+                if !cell.flags.contains(CellFlags::WIDE_SPACER) {
+                    s.push(cell.ch);
+                }
+            }
+        }
+        for r in 0..t.rows() {
+            s.push_str(&row_str(t, r));
+        }
+        s.trim_end().to_string()
+    }
+
+    #[test]
+    fn deferred_fill_exact_stays_and_does_not_scroll() {
+        let mut t = term(3, 2);
+        print_str(&mut t, "abc");
+        assert_eq!(t.cursor(), (2, 0));
+        print_str(&mut t, "def");
+        assert_eq!(t.cursor(), (2, 1));
+        assert_eq!(t.scrollback.len(), 0);
+        assert_eq!(row_str(&t, 0), "abc");
+        t.print('g'); // now the wrap scrolls
+        assert_eq!(t.scrollback.len(), 1);
+        assert_eq!(t.scrollback[0].0[0].ch, 'a');
+        assert_eq!(row_str(&t, 1), "g");
+    }
+
+    #[test]
+    fn deferred_cr_cancels_pending_wrap() {
+        let mut t = term(3, 2);
+        print_str(&mut t, "abc");
+        t.carriage_return();
+        assert!(!t.pending_wrap);
+        t.print('x');
+        assert_eq!(t.get_cell(0, 0).unwrap().ch, 'x');
+        assert_eq!(t.get_cell(0, 1).unwrap().ch, ' ');
+        assert_eq!(t.cursor(), (1, 0));
+    }
+
+    #[test]
+    fn deferred_exact_line_then_linefeed_no_blank_row() {
+        let mut t = term(3, 3);
+        print_str(&mut t, "abc");
+        t.linefeed();
+        t.print('d');
+        assert_eq!(t.get_cell(0, 1).unwrap().ch, 'd');
+        assert_eq!(t.get_cell(0, 2).unwrap().ch, ' ');
+        assert_eq!(t.cursor(), (1, 1));
+    }
+
+    #[test]
+    fn wrapped_flags_continuation_vs_newline() {
+        let mut t = term(3, 4);
+        print_str(&mut t, "abcd");
+        assert!(!t.active_wrapped()[0]);
+        assert!(t.active_wrapped()[1]);
+        t.linefeed();
+        t.print('e');
+        assert_eq!(t.get_cell(0, 2).unwrap().ch, 'e');
+        assert!(!t.active_wrapped()[2]);
+    }
+
+    #[test]
+    fn wrapped_flag_survives_into_scrollback() {
+        let mut t = term(3, 2);
+        print_str(&mut t, "abcdefg");
+        print_str(&mut t, "hi");
+        t.linefeed();
+        assert_eq!(t.scrollback.len(), 2);
+        assert!(!t.scrollback[0].1);
+        assert!(t.scrollback[1].1);
+        assert_eq!(t.scrollback[1].0[0].ch, 'd');
+    }
+
+    #[test]
+    fn reflow_narrower_splits_preserving_order() {
+        let mut t = term(4, 4);
+        print_str(&mut t, "abcdefgh");
+        t.resize(2, 4);
+        assert_eq!(row_str(&t, 0), "ab");
+        assert_eq!(row_str(&t, 3), "gh");
+        assert_eq!(all_text(&t), "abcdefgh");
+        assert_eq!(t.active_wrapped(), &vec![false, true, true, true]);
+        assert_eq!(t.scrollback.len(), 0);
+    }
+
+    #[test]
+    fn reflow_wider_joins_wrapped_rows() {
+        let mut t = term(2, 4);
+        print_str(&mut t, "abcdefgh");
+        t.resize(4, 4);
+        assert_eq!(row_str(&t, 0), "abcd");
+        assert_eq!(row_str(&t, 1), "efgh");
+        assert_eq!(t.active_wrapped(), &vec![false, true, false, false]);
+    }
+
+    #[test]
+    fn reflow_includes_scrollback_content() {
+        let mut t = term(4, 2);
+        print_str(&mut t, "aaaa");
+        t.linefeed();
+        print_str(&mut t, "bbbb");
+        t.linefeed();
+        print_str(&mut t, "cc");
+        assert_eq!(t.scrollback.len(), 1);
+        t.resize(2, 2);
+        assert_eq!(t.scrollback.len(), 3);
+        assert_eq!(all_text(&t), "aaaabbbbcc");
+        assert_eq!(row_str(&t, 1), "cc");
+    }
+
+    #[test]
+    fn reflow_never_splits_wide_char() {
+        let mut t = term(5, 2);
+        print_str(&mut t, "ab");
+        t.print('\u{754C}');
+        t.print('c');
+        t.resize(3, 3);
+        assert_eq!(t.get_cell(2, 0).unwrap().ch, ' ');
+        assert!(!t
+            .get_cell(2, 0)
+            .unwrap()
+            .flags
+            .contains(CellFlags::WIDE_SPACER));
+        assert_eq!(t.get_cell(0, 1).unwrap().ch, '\u{754C}');
+        assert!(t
+            .get_cell(1, 1)
+            .unwrap()
+            .flags
+            .contains(CellFlags::WIDE_SPACER));
+        assert_eq!(t.get_cell(2, 1).unwrap().ch, 'c');
+        assert!(t.active_wrapped()[1]);
+    }
+
+    #[test]
+    fn reflow_alt_overflow_dropped_not_scrollback() {
+        let mut t = term(4, 2);
+        print_str(&mut t, "main");
+        t.set_alt_screen_1049(true);
+        t.cursor_goto(0, 0);
+        print_str(&mut t, "abcdefgh");
+        t.resize(2, 2);
+        assert_eq!(t.scrollback.len(), 0);
+        assert_eq!(row_str(&t, 0), "ef");
+        assert_eq!(row_str(&t, 1), "gh");
+        t.set_alt_screen_1049(false);
+        assert_eq!(row_str(&t, 0), "ma");
+        assert_eq!(row_str(&t, 1), "in");
+    }
+
+    #[test]
+    fn reflow_cursor_remapped_through_logical_line() {
+        let mut t = term(4, 4);
+        print_str(&mut t, "abcdefgh");
+        assert_eq!(t.cursor(), (3, 1)); // offset 7
+        t.resize(2, 4);
+        assert_eq!(t.cursor(), (1, 3)); // 7 / 2, 7 % 2
+        let mut t = term(2, 4);
+        print_str(&mut t, "abcde");
+        assert_eq!(t.cursor(), (1, 2)); // offset 5
+        t.resize(4, 4);
+        assert_eq!(t.cursor(), (1, 1)); // 5 / 4, 5 % 4
+    }
+
+    #[test]
+    fn deferred_wide_after_pending_and_empty_resize() {
+        let mut t = term(3, 3);
+        print_str(&mut t, "abc");
+        t.print('\u{754C}'); // wraps first, then wide on row 1
+        assert_eq!(t.get_cell(0, 1).unwrap().ch, '\u{754C}');
+        assert!(t.active_wrapped()[1]);
+        let mut empty = term(4, 2);
+        empty.resize(2, 3);
+        assert_eq!(empty.cursor(), (0, 0));
+        assert_eq!(empty.get_cell(0, 0).unwrap().ch, ' ');
+        assert_eq!(empty.scrollback.len(), 0);
+    }
+
+    #[test]
+    fn reflow_rows_only_and_unchanged_idempotent() {
+        let mut t = term(4, 3);
+        print_str(&mut t, "abcdefg");
+        t.resize(4, 3);
+        let once = (row_str(&t, 0), row_str(&t, 1), t.active_wrapped().clone());
+        t.resize(4, 3);
+        assert_eq!(row_str(&t, 0), once.0);
+        assert_eq!(row_str(&t, 1), once.1);
+        assert_eq!(t.active_wrapped(), &once.2);
+        let mut t = term(4, 3);
+        print_str(&mut t, "ab");
+        t.linefeed();
+        print_str(&mut t, "cd");
+        t.linefeed();
+        print_str(&mut t, "ef");
+        t.resize(4, 2);
+        assert_eq!(t.scrollback.len(), 1);
+        assert_eq!(row_str(&t, 0), "cd");
+        assert_eq!(row_str(&t, 1), "ef");
     }
 
     #[test]
