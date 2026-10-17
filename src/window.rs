@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use winit::{
     dpi::{LogicalSize, PhysicalPosition, PhysicalSize},
     event::MouseButton,
@@ -14,6 +15,18 @@ use crate::pty::PtyManager;
 use crate::renderer::Renderer;
 use crate::terminal::{MouseTracking, Terminal};
 
+/// User events delivered to the event loop via `EventLoopProxy`.
+#[derive(Debug)]
+pub enum WispUserEvent {
+    /// The PTY reader thread queued output; parse and redraw.
+    PtyOutput,
+}
+
+/// Cursor blink period.
+const BLINK_PERIOD: Duration = Duration::from_millis(530);
+/// Synchronized-output failsafe: present anyway after this hold.
+const SYNC_FAILSAFE: Duration = Duration::from_millis(100);
+
 pub struct WispWindow {
     window: Arc<Window>,
     renderer: Renderer,
@@ -26,10 +39,30 @@ pub struct WispWindow {
     last_mouse_position: Option<PhysicalPosition<f64>>,
     /// Last cell sent in a mouse report, for per-cell motion dedupe.
     last_reported_cell: Option<(usize, usize)>,
+    /// Cached physical cell metrics (computed in `new`, refreshed in
+    /// `resize`) so mouse positioning needs no per-move `FontManager`.
+    cell_width: f32,
+    cell_height: f32,
+    padding: f32,
+    /// Current cursor blink phase and its next flip deadline.
+    blink_on: bool,
+    next_blink: Instant,
+    /// When the current synchronized-output hold was first observed.
+    sync_since: Option<Instant>,
+}
+
+/// Physical (cell width, cell height, padding) for `config` at `scale`.
+fn physical_metrics(config: &Config, scale: f32) -> (f32, f32, f32) {
+    let mut font_manager = crate::font::FontManager::new(config.font_size * scale);
+    (
+        font_manager.cell_width(),
+        font_manager.cell_height(),
+        config.padding * scale,
+    )
 }
 
 impl WispWindow {
-    pub fn new(event_loop: &EventLoop<()>) -> Self {
+    pub fn new(event_loop: &EventLoop<WispUserEvent>) -> Self {
         let config = Config::load();
 
         // Calculate initial window size based on terminal grid.
@@ -56,13 +89,22 @@ impl WispWindow {
         // Enable IME for text input
         window.set_ime_allowed(true);
 
+        let scale = window.scale_factor() as f32;
+        let (cell_width, cell_height, padding) = physical_metrics(&config, scale);
+
         let renderer = Renderer::new(window.clone(), &config);
         let mut terminal = Terminal::new(config.cols, config.rows);
         terminal.set_scrollback_limit(config.scrollback_lines.clamp(100, 100_000));
         let parser = AnsiParser::new(terminal);
-        let pty =
+        let mut pty =
             PtyManager::with_shell(config.cols as u16, config.rows as u16, config.shell.clone())
                 .expect("Failed to create PTY");
+
+        // Let the PTY reader thread wake the (sleeping) event loop.
+        let proxy = event_loop.create_proxy();
+        pty.set_waker(Arc::new(move || {
+            let _ = proxy.send_event(WispUserEvent::PtyOutput);
+        }));
 
         let clipboard = arboard::Clipboard::new()
             .map_err(|e| log::warn!("Clipboard unavailable: {e}"))
@@ -79,6 +121,12 @@ impl WispWindow {
             mouse_pressed: false,
             last_mouse_position: None,
             last_reported_cell: None,
+            cell_width,
+            cell_height,
+            padding,
+            blink_on: true,
+            next_blink: Instant::now() + BLINK_PERIOD,
+            sync_since: None,
         }
     }
 
@@ -89,19 +137,19 @@ impl WispWindow {
     pub fn resize(&mut self, new_size: PhysicalSize<u32>) {
         self.renderer.resize(new_size);
 
-        // Calculate new grid size. new_size is in physical pixels, so the cell
-        // metrics and padding must also be in physical pixels (scaled).
+        // Refresh cached physical metrics, then derive the new grid size.
+        // new_size is in physical pixels, as are the cached metrics.
         let scale = self.window.scale_factor() as f32;
-        let mut font_manager = crate::font::FontManager::new(self.config.font_size * scale);
-        let cell_width = font_manager.cell_width();
-        let cell_height = font_manager.cell_height();
-        let padding = self.config.padding * scale * 2.0;
+        let (cell_width, cell_height, padding) = physical_metrics(&self.config, scale);
+        self.cell_width = cell_width;
+        self.cell_height = cell_height;
+        self.padding = padding;
 
-        let available_width = new_size.width as f32 - padding;
-        let available_height = new_size.height as f32 - padding;
+        let available_width = new_size.width as f32 - self.padding * 2.0;
+        let available_height = new_size.height as f32 - self.padding * 2.0;
 
-        let new_cols = (available_width / cell_width).floor() as usize;
-        let new_rows = (available_height / cell_height).floor() as usize;
+        let new_cols = (available_width / self.cell_width).floor() as usize;
+        let new_rows = (available_height / self.cell_height).floor() as usize;
 
         // Ensure minimum size
         let new_cols = new_cols.max(10);
@@ -110,11 +158,17 @@ impl WispWindow {
         // Resize terminal and PTY
         self.parser.terminal_mut().resize(new_cols, new_rows);
         self.pty.resize(new_cols as u16, new_rows as u16);
+
+        self.window.request_redraw();
     }
 
-    pub fn render(&mut self) {
-        // Read from PTY and process
+    /// Drain queued PTY output into the terminal (parsing, query replies,
+    /// title). Returns true if any bytes were processed. Presentation is
+    /// separate (`render`) so synchronized output can hold frames.
+    pub fn process_pty(&mut self) -> bool {
+        let mut processed = false;
         while let Some(data) = self.pty.try_read() {
+            processed = true;
             log::debug!(
                 "PTY output: {:?} '{}'",
                 data,
@@ -127,15 +181,89 @@ impl WispWindow {
             }
         }
 
-        // Apply OSC title changes.
-        if let Some(title) = self.parser.terminal().title() {
-            if self.last_title.as_deref() != Some(title) {
-                self.window.set_title(title);
-                self.last_title = Some(title.to_owned());
+        if processed {
+            // Arm/clear the sync failsafe from the post-parse flag.
+            if self.parser.terminal().sync_output() {
+                if self.sync_since.is_none() {
+                    self.sync_since = Some(Instant::now());
+                }
+            } else {
+                self.sync_since = None;
+            }
+
+            // Apply OSC title changes.
+            if let Some(title) = self.parser.terminal().title() {
+                if self.last_title.as_deref() != Some(title) {
+                    self.window.set_title(title);
+                    self.last_title = Some(title.to_owned());
+                }
             }
         }
 
-        self.renderer.render(self.parser.terminal());
+        processed
+    }
+
+    /// True while synchronized output (`?2026`) holds presentation and
+    /// the 100 ms failsafe has not yet expired.
+    pub fn sync_holding(&self) -> bool {
+        if !self.parser.terminal().sync_output() {
+            return false;
+        }
+        match self.sync_since {
+            Some(since) => since.elapsed() < SYNC_FAILSAFE,
+            // Flag set but no armed hold (failsafe already fired): present.
+            None => false,
+        }
+    }
+
+    /// Earliest deadline the event loop must wake for: the next blink
+    /// flip, or the sync failsafe if it comes first.
+    pub fn next_deadline(&self) -> Instant {
+        let mut deadline = self.next_blink;
+        if self.parser.terminal().sync_output() {
+            if let Some(since) = self.sync_since {
+                deadline = deadline.min(since + SYNC_FAILSAFE);
+            }
+        }
+        deadline
+    }
+
+    /// Advance time-based state (blink phase, sync failsafe). Returns
+    /// true when a redraw should be requested.
+    pub fn tick(&mut self) -> bool {
+        let now = Instant::now();
+        let mut needs_redraw = false;
+
+        if self.parser.terminal().sync_output() {
+            if let Some(since) = self.sync_since {
+                if now >= since + SYNC_FAILSAFE {
+                    // Present anyway; a later held batch re-arms the hold.
+                    self.sync_since = None;
+                    needs_redraw = true;
+                }
+            }
+        } else {
+            self.sync_since = None;
+        }
+
+        if now >= self.next_blink {
+            // The blink deadline doubles as the periodic wake the shell-exit
+            // check rides on, so it keeps rescheduling even when blinking is
+            // disabled in config (in which case the cursor stays steady-on).
+            if self.config.cursor_blink {
+                self.blink_on = !self.blink_on;
+                if self.parser.terminal().cursor_visible() {
+                    needs_redraw = true;
+                }
+            }
+            self.next_blink = now + BLINK_PERIOD;
+        }
+
+        needs_redraw
+    }
+
+    pub fn render(&mut self) {
+        self.renderer.render(self.parser.terminal(), self.blink_on);
     }
 
     /// Has the shell (PTY child) exited? The event loop closes the window
@@ -239,6 +367,7 @@ impl WispWindow {
         if let Some(position) = self.last_mouse_position {
             if let Some((col, row)) = self.position_to_grid(position) {
                 self.parser.terminal_mut().set_selection_start(col, row);
+                self.window.request_redraw();
             }
         }
     }
@@ -284,6 +413,7 @@ impl WispWindow {
         // Convert physical position to grid coordinates
         if let Some((col, row)) = self.position_to_grid(position) {
             self.parser.terminal_mut().set_selection_end(col, row);
+            self.window.request_redraw();
         }
     }
 
@@ -329,31 +459,30 @@ impl WispWindow {
 
         if delta > 0.0 {
             self.parser.terminal_mut().scroll_viewport_up(lines);
+            self.window.request_redraw();
         } else if delta < 0.0 {
             self.parser.terminal_mut().scroll_viewport_down(lines);
+            self.window.request_redraw();
         }
     }
 
-    /// Convert physical pixel position to grid coordinates (col, row)
+    /// Convert physical pixel position to grid coordinates (col, row).
+    /// Uses the cached physical cell metrics only.
     fn position_to_grid(&self, position: PhysicalPosition<f64>) -> Option<(usize, usize)> {
-        let scale = self.window.scale_factor() as f32;
-        let padding = self.config.padding * scale;
-
-        // Calculate cell dimensions
-        let mut font_manager = crate::font::FontManager::new(self.config.font_size * scale);
-        let cell_width = font_manager.cell_width();
-        let cell_height = font_manager.cell_height();
+        if self.cell_width <= 0.0 || self.cell_height <= 0.0 {
+            return None;
+        }
 
         // Adjust for padding
-        let x = position.x as f32 - padding;
-        let y = position.y as f32 - padding;
+        let x = position.x as f32 - self.padding;
+        let y = position.y as f32 - self.padding;
 
         if x < 0.0 || y < 0.0 {
             return None;
         }
 
-        let col = (x / cell_width) as usize;
-        let row = (y / cell_height) as usize;
+        let col = (x / self.cell_width) as usize;
+        let row = (y / self.cell_height) as usize;
 
         let terminal = self.parser.terminal();
         if col >= terminal.cols() || row >= terminal.rows() {
