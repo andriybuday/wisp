@@ -183,6 +183,75 @@ pub fn key_to_bytes(
     }
 }
 
+/// xterm mouse button codes (before modifier/motion bits are added).
+pub const MOUSE_LEFT: u32 = 0;
+pub const MOUSE_MIDDLE: u32 = 1;
+pub const MOUSE_RIGHT: u32 = 2;
+pub const MOUSE_WHEEL_UP: u32 = 64;
+pub const MOUSE_WHEEL_DOWN: u32 = 65;
+/// Added to a button code to mark a motion event.
+pub const MOUSE_MOTION: u32 = 32;
+/// Motion with no button held (any-event tracking, ?1003): motion + button 3.
+pub const MOUSE_NO_BUTTON_MOTION: u32 = 35;
+
+/// Base button code for a winit mouse button; `None` for buttons xterm
+/// mouse reporting does not encode.
+pub fn mouse_button_base(button: winit::event::MouseButton) -> Option<u32> {
+    use winit::event::MouseButton;
+    match button {
+        MouseButton::Left => Some(MOUSE_LEFT),
+        MouseButton::Middle => Some(MOUSE_MIDDLE),
+        MouseButton::Right => Some(MOUSE_RIGHT),
+        _ => None,
+    }
+}
+
+/// Modifier bits added to a mouse button code: Shift 4, Alt 8, Ctrl 16.
+pub fn mouse_modifiers(modifiers: ModifiersState) -> u32 {
+    let mut bits = 0;
+    if modifiers.shift_key() {
+        bits += 4;
+    }
+    if modifiers.alt_key() {
+        bits += 8;
+    }
+    if modifiers.control_key() {
+        bits += 16;
+    }
+    bits
+}
+
+/// Encode one xterm mouse report for cell (`col`, `row`) (0-based).
+///
+/// SGR form (?1006): `ESC [ < {button} ; {col+1} ; {row+1} M` for a press,
+/// final `m` for a release. Legacy form: `ESC [ M` followed by the button,
+/// column, and row as single bytes, each `value + 32` clamped to 255; a
+/// release cannot identify the button, so its low button bits become 3
+/// (modifier and motion bits are kept).
+pub fn encode_mouse(button: u32, col: usize, row: usize, pressed: bool, sgr: bool) -> Vec<u8> {
+    if sgr {
+        let final_byte = if pressed { 'M' } else { 'm' };
+        format!(
+            "\x1b[<{};{};{}{}",
+            button,
+            col.saturating_add(1),
+            row.saturating_add(1),
+            final_byte
+        )
+        .into_bytes()
+    } else {
+        let effective = if pressed {
+            button
+        } else {
+            (button & !0b11) | 3
+        };
+        let enc = |v: u32| v.saturating_add(32).min(255) as u8;
+        let cx = u32::try_from(col.saturating_add(1)).unwrap_or(u32::MAX);
+        let cy = u32::try_from(row.saturating_add(1)).unwrap_or(u32::MAX);
+        vec![0x1b, b'[', b'M', enc(effective), enc(cx), enc(cy)]
+    }
+}
+
 /// F1-F4: SS3 form unmodified, `CSI 1;{m}` form modified.
 fn f1_f4(final_byte: u8, m: u8) -> Vec<u8> {
     if m > 1 {
@@ -448,6 +517,118 @@ mod tests {
         assert_eq!(key_mod(KeyCode::ArrowUp, sup), None);
         assert_eq!(key_mod(KeyCode::Enter, sup), None);
         assert_eq!(key_mod(KeyCode::F1, sup | ModifiersState::SHIFT), None);
+    }
+
+    #[test]
+    fn mouse_sgr_press_and_release() {
+        // Left press at (0,0) reports 1-based cell 1;1 with final 'M'.
+        assert_eq!(encode_mouse(MOUSE_LEFT, 0, 0, true, true), b"\x1b[<0;1;1M");
+        // Release keeps the button code and uses final 'm'.
+        assert_eq!(encode_mouse(MOUSE_LEFT, 0, 0, false, true), b"\x1b[<0;1;1m");
+        // Right button at a non-origin cell.
+        assert_eq!(
+            encode_mouse(MOUSE_RIGHT, 9, 4, true, true),
+            b"\x1b[<2;10;5M"
+        );
+        assert_eq!(
+            encode_mouse(MOUSE_MIDDLE, 9, 4, false, true),
+            b"\x1b[<1;10;5m"
+        );
+    }
+
+    #[test]
+    fn mouse_legacy_press_and_release() {
+        // Bytes are value+32: button 0 -> 32, col/row 1-based 1 -> 33.
+        assert_eq!(
+            encode_mouse(MOUSE_LEFT, 0, 0, true, false),
+            vec![0x1b, b'[', b'M', 32, 33, 33]
+        );
+        // Legacy release uses button 3 regardless of which button.
+        assert_eq!(
+            encode_mouse(MOUSE_LEFT, 0, 0, false, false),
+            vec![0x1b, b'[', b'M', 35, 33, 33]
+        );
+        assert_eq!(
+            encode_mouse(MOUSE_RIGHT, 4, 2, false, false),
+            vec![0x1b, b'[', b'M', 35, 37, 35]
+        );
+        assert_eq!(
+            encode_mouse(MOUSE_RIGHT, 4, 2, true, false),
+            vec![0x1b, b'[', b'M', 34, 37, 35]
+        );
+    }
+
+    #[test]
+    fn mouse_motion_adds_32_and_no_button_is_35() {
+        let drag = MOUSE_LEFT + MOUSE_MOTION;
+        assert_eq!(encode_mouse(drag, 2, 3, true, true), b"\x1b[<32;3;4M");
+        assert_eq!(
+            encode_mouse(drag, 2, 3, true, false),
+            vec![0x1b, b'[', b'M', 64, 35, 36]
+        );
+        assert_eq!(MOUSE_NO_BUTTON_MOTION, 35);
+        assert_eq!(
+            encode_mouse(MOUSE_NO_BUTTON_MOTION, 0, 0, true, true),
+            b"\x1b[<35;1;1M"
+        );
+    }
+
+    #[test]
+    fn mouse_wheel_buttons_64_and_65() {
+        assert_eq!(
+            encode_mouse(MOUSE_WHEEL_UP, 5, 5, true, true),
+            b"\x1b[<64;6;6M"
+        );
+        assert_eq!(
+            encode_mouse(MOUSE_WHEEL_DOWN, 5, 5, true, true),
+            b"\x1b[<65;6;6M"
+        );
+        assert_eq!(
+            encode_mouse(MOUSE_WHEEL_UP, 0, 0, true, false),
+            vec![0x1b, b'[', b'M', 96, 33, 33]
+        );
+    }
+
+    #[test]
+    fn mouse_modifier_bits() {
+        assert_eq!(mouse_modifiers(ModifiersState::SHIFT), 4);
+        assert_eq!(mouse_modifiers(ModifiersState::ALT), 8);
+        assert_eq!(mouse_modifiers(ModifiersState::CONTROL), 16);
+        assert_eq!(
+            mouse_modifiers(ModifiersState::SHIFT | ModifiersState::ALT | ModifiersState::CONTROL),
+            28
+        );
+        assert_eq!(mouse_modifiers(ModifiersState::empty()), 0);
+        // Ctrl+left press: 16 + 0 = 16 in both encodings.
+        let code = MOUSE_LEFT + mouse_modifiers(ModifiersState::CONTROL);
+        assert_eq!(encode_mouse(code, 0, 0, true, true), b"\x1b[<16;1;1M");
+        assert_eq!(
+            encode_mouse(code, 0, 0, true, false),
+            vec![0x1b, b'[', b'M', 48, 33, 33]
+        );
+        // Legacy release keeps modifier bits but reports button 3: 16|3=19 -> 51.
+        assert_eq!(
+            encode_mouse(code, 0, 0, false, false),
+            vec![0x1b, b'[', b'M', 51, 33, 33]
+        );
+    }
+
+    #[test]
+    fn mouse_legacy_coordinates_clamp_at_255() {
+        // col 300 -> 301+32 clamps to 255; SGR is not clamped.
+        assert_eq!(
+            encode_mouse(MOUSE_LEFT, 300, 1000, true, false),
+            vec![0x1b, b'[', b'M', 32, 255, 255]
+        );
+        assert_eq!(
+            encode_mouse(MOUSE_LEFT, 300, 1000, true, true),
+            b"\x1b[<0;301;1001M"
+        );
+        // An oversized button value also clamps instead of overflowing.
+        assert_eq!(
+            encode_mouse(1000, 0, 0, true, false),
+            vec![0x1b, b'[', b'M', 255, 33, 33]
+        );
     }
 
     #[test]

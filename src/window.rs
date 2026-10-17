@@ -1,15 +1,18 @@
 use std::sync::Arc;
 use winit::{
     dpi::{LogicalSize, PhysicalPosition, PhysicalSize},
+    event::MouseButton,
     event_loop::EventLoop,
+    keyboard::ModifiersState,
     window::{Window, WindowAttributes},
 };
 
 use crate::config::Config;
+use crate::input;
 use crate::parser::AnsiParser;
 use crate::pty::PtyManager;
 use crate::renderer::Renderer;
-use crate::terminal::Terminal;
+use crate::terminal::{MouseTracking, Terminal};
 
 pub struct WispWindow {
     window: Arc<Window>,
@@ -21,6 +24,8 @@ pub struct WispWindow {
     last_title: Option<String>,
     mouse_pressed: bool,
     last_mouse_position: Option<PhysicalPosition<f64>>,
+    /// Last cell sent in a mouse report, for per-cell motion dedupe.
+    last_reported_cell: Option<(usize, usize)>,
 }
 
 impl WispWindow {
@@ -71,6 +76,7 @@ impl WispWindow {
             last_title: None,
             mouse_pressed: false,
             last_mouse_position: None,
+            last_reported_cell: None,
         }
     }
 
@@ -172,8 +178,53 @@ impl WispWindow {
         }
     }
 
-    /// Handle mouse press for selection start
-    pub fn mouse_press(&mut self) {
+    /// True when mouse events go to the application instead of local
+    /// selection/scrolling: the app enabled tracking and Shift (the usual
+    /// user override) is not held.
+    fn mouse_reporting_active(&self, modifiers: ModifiersState) -> bool {
+        self.parser.terminal().mouse_tracking() != MouseTracking::Off && !modifiers.shift_key()
+    }
+
+    /// Encode one mouse report in the negotiated encoding and send it to
+    /// the application via the PTY.
+    fn report_mouse(&mut self, button: u32, col: usize, row: usize, pressed: bool) {
+        let sgr = self.parser.terminal().sgr_mouse();
+        let bytes = input::encode_mouse(button, col, row, pressed, sgr);
+        let _ = self.pty.write(&bytes);
+    }
+
+    /// The cell under the cursor for reporting, clamped into the grid.
+    fn report_cell(&self) -> Option<(usize, usize)> {
+        self.last_mouse_position
+            .map(|pos| self.position_to_grid_clamped(pos))
+    }
+
+    /// Handle a focus change: report `ESC [ I` / `ESC [ O` when the
+    /// application enabled focus reporting (?1004).
+    pub fn focus_changed(&mut self, focused: bool) {
+        if self.parser.terminal().focus_reporting() {
+            let seq: &[u8] = if focused { b"\x1b[I" } else { b"\x1b[O" };
+            let _ = self.pty.write(seq);
+        }
+    }
+
+    /// Handle mouse press: reported to the app while tracking is active,
+    /// otherwise starts a local (left-button) selection.
+    pub fn mouse_press(&mut self, button: MouseButton, modifiers: ModifiersState) {
+        if self.mouse_reporting_active(modifiers) {
+            if let (Some(base), Some((col, row))) =
+                (input::mouse_button_base(button), self.report_cell())
+            {
+                self.last_reported_cell = Some((col, row));
+                let code = base + input::mouse_modifiers(modifiers);
+                self.report_mouse(code, col, row, true);
+            }
+            return;
+        }
+
+        if button != MouseButton::Left {
+            return;
+        }
         self.mouse_pressed = true;
 
         // Convert physical position to grid coordinates
@@ -184,9 +235,39 @@ impl WispWindow {
         }
     }
 
-    /// Handle mouse drag for selection update
-    pub fn mouse_move(&mut self, position: PhysicalPosition<f64>) {
+    /// Handle cursor motion: reported per the tracking level (button-event
+    /// needs a held button, any-event always reports), once per cell
+    /// change; otherwise updates the local selection drag.
+    pub fn mouse_move(
+        &mut self,
+        position: PhysicalPosition<f64>,
+        modifiers: ModifiersState,
+        pressed_buttons: &[MouseButton],
+    ) {
         self.last_mouse_position = Some(position);
+
+        if self.mouse_reporting_active(modifiers) {
+            let mods = input::mouse_modifiers(modifiers);
+            let held = pressed_buttons
+                .iter()
+                .find_map(|b| input::mouse_button_base(*b));
+            let code = match self.parser.terminal().mouse_tracking() {
+                MouseTracking::ButtonEvent => held.map(|base| base + input::MOUSE_MOTION + mods),
+                MouseTracking::AnyEvent => Some(match held {
+                    Some(base) => base + input::MOUSE_MOTION + mods,
+                    None => input::MOUSE_NO_BUTTON_MOTION + mods,
+                }),
+                MouseTracking::Off | MouseTracking::Normal => None,
+            };
+            if let Some(code) = code {
+                let (col, row) = self.position_to_grid_clamped(position);
+                if self.last_reported_cell != Some((col, row)) {
+                    self.last_reported_cell = Some((col, row));
+                    self.report_mouse(code, col, row, true);
+                }
+            }
+            return;
+        }
 
         if !self.mouse_pressed {
             return;
@@ -198,13 +279,42 @@ impl WispWindow {
         }
     }
 
-    /// Handle mouse release
-    pub fn mouse_release(&mut self) {
-        self.mouse_pressed = false;
+    /// Handle mouse release: reported to the app while tracking is active,
+    /// otherwise ends the local selection drag.
+    pub fn mouse_release(&mut self, button: MouseButton, modifiers: ModifiersState) {
+        if self.mouse_reporting_active(modifiers) {
+            if let (Some(base), Some((col, row))) =
+                (input::mouse_button_base(button), self.report_cell())
+            {
+                let code = base + input::mouse_modifiers(modifiers);
+                self.report_mouse(code, col, row, false);
+            }
+            return;
+        }
+
+        if button == MouseButton::Left {
+            self.mouse_pressed = false;
+        }
     }
 
-    /// Handle mouse wheel for scrolling
-    pub fn mouse_wheel(&mut self, delta: f32) {
+    /// Handle mouse wheel: reported as buttons 64/65 at the cursor cell
+    /// while tracking is active, otherwise scrolls the viewport.
+    pub fn mouse_wheel(&mut self, delta: f32, modifiers: ModifiersState) {
+        if self.mouse_reporting_active(modifiers) {
+            if delta != 0.0 {
+                if let Some((col, row)) = self.report_cell() {
+                    let base = if delta > 0.0 {
+                        input::MOUSE_WHEEL_UP
+                    } else {
+                        input::MOUSE_WHEEL_DOWN
+                    };
+                    let code = base + input::mouse_modifiers(modifiers);
+                    self.report_mouse(code, col, row, true);
+                }
+            }
+            return;
+        }
+
         // Positive delta = scroll up (show older content)
         // Negative delta = scroll down (show newer content)
         let lines = (delta.abs() / 10.0).ceil().max(1.0) as usize;
@@ -243,5 +353,40 @@ impl WispWindow {
         }
 
         Some((col, row))
+    }
+
+    /// Like `position_to_grid`, but clamps into the grid instead of
+    /// returning `None`: positions in the padding or past the last cell
+    /// map to the nearest edge cell. Used for mouse reporting, where an
+    /// edge event must still be reported.
+    fn position_to_grid_clamped(&self, position: PhysicalPosition<f64>) -> (usize, usize) {
+        let scale = self.window.scale_factor() as f32;
+        let padding = self.config.padding * scale;
+
+        let mut font_manager = crate::font::FontManager::new(self.config.font_size * scale);
+        let cell_width = font_manager.cell_width();
+        let cell_height = font_manager.cell_height();
+
+        let x = position.x as f32 - padding;
+        let y = position.y as f32 - padding;
+
+        let terminal = self.parser.terminal();
+        let max_col = terminal.cols().saturating_sub(1);
+        let max_row = terminal.rows().saturating_sub(1);
+
+        let col = if x <= 0.0 {
+            0
+        } else {
+            (x / cell_width) as usize
+        }
+        .min(max_col);
+        let row = if y <= 0.0 {
+            0
+        } else {
+            (y / cell_height) as usize
+        }
+        .min(max_row);
+
+        (col, row)
     }
 }
