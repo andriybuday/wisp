@@ -9,10 +9,10 @@ A minimalist terminal emulator.
 - ✅ Basic window creation
 - ✅ GPU-accelerated rendering (wgpu)
 - ✅ Text rendering with monospace font
-- ⏳ PTY integration (shell spawning)
-- ⏳ ANSI escape sequence parsing
-- ⏳ Keyboard input handling
-- ⏳ Text selection & clipboard
+- ✅ PTY integration (shell spawning)
+- ✅ ANSI escape sequence parsing
+- ✅ Keyboard input handling
+- ✅ Text selection & clipboard
 
 ## Goals
 - Simple and focused
@@ -67,19 +67,24 @@ Workflow for a new feature, from your coding agent:
 ## Current Features
 
 ✅ Basic window and rendering  
-✅ Shell integration (PTY)  
-✅ Keyboard input  
-✅ ANSI escape sequences  
-✅ Scrollback buffer  
-✅ Color rendering (16 ANSI colors + bright variants)  
-✅ Text attributes (bold, underline, inverse)  
-✅ Visual cursor  
-✅ PTY resize on window resize  
-✅ Text selection (mouse drag)  
-✅ Copy/paste (Cmd+C / Cmd+V on macOS)  
-✅ Scrollback navigation (mouse wheel)  
+✅ Shell integration (PTY); window closes when the shell exits  
+✅ Keyboard input (Ctrl/Alt combos, F-keys, modified arrows)  
+✅ ANSI escape sequences, alternate screen, scroll regions  
+✅ Scrollback buffer with mouse-wheel navigation  
+✅ Color rendering (256 colors + truecolor)  
+✅ Text attributes (bold, dim, italic flag, underline, strikethrough, inverse)  
+✅ Blinking visual cursor; event-driven rendering (idle CPU near zero)  
+✅ Resize with line reflow; PTY resize on window resize  
+✅ Text selection (drag, double-click word, triple-click line, scrollback)  
+✅ Copy/paste (Cmd+C / Cmd+V on macOS, bracketed paste)  
+✅ SGR mouse reporting and focus events for vim/tmux-style apps  
+✅ Unicode wide-character (CJK/emoji) cell widths  
+✅ OSC 8 hyperlinks (Cmd/Ctrl-click to open)  
+✅ Scrollback search (Cmd+F / Ctrl+Shift+F)  
+✅ Optional TOML config (`~/.config/wisp/config.toml`)  
 
-See [STATUS.md](STATUS.md) for detailed progress.
+Feature history lives in [specs/](specs/); [STATUS.md](STATUS.md) is an early
+project snapshot.
 
 ## Tech Stack
 - Rust

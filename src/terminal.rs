@@ -2978,4 +2978,48 @@ mod tests {
         assert_eq!(t.get_viewport_cell(0, 2).unwrap().ch, 'e');
         assert_eq!(t.abs_line_to_viewport_row(0), None);
     }
+
+    #[test]
+    fn wave4_search_then_select_copies_found_line() {
+        // Cross-feature (015 + 014): jump to a search hit in scrollback,
+        // line-select it there, and copy exactly that line (trimmed).
+        let mut t = term(10, 3);
+        print_str(&mut t, "needle   ");
+        t.linefeed();
+        print_str(&mut t, "filler one");
+        t.linefeed();
+        print_str(&mut t, "filler two");
+        t.linefeed();
+        print_str(&mut t, "tail");
+        // "needle" has scrolled into scrollback by now.
+        let matches = t.find_matches("NEEDLE");
+        assert_eq!(matches.len(), 1);
+        let (abs_line, start, end) = matches[0];
+        assert_eq!((start, end), (0, 6));
+        t.scroll_to_absolute_line(abs_line);
+        let row = t.abs_line_to_viewport_row(abs_line).expect("match visible");
+        t.select_line_at(row);
+        assert_eq!(t.get_selected_text(), "needle");
+    }
+
+    #[test]
+    fn wave4_search_still_locates_text_after_reflow() {
+        // Cross-feature (015 + 011): after a narrower resize reflows the
+        // content, search reports the word at its new absolute line.
+        let mut t = term(10, 4);
+        print_str(&mut t, "aaaa dd");
+        assert_eq!(t.find_matches("dd").len(), 1);
+        t.resize(5, 4);
+        let matches = t.find_matches("dd");
+        assert_eq!(matches.len(), 1, "word must survive reflow unsplit here");
+        let (abs_line, ..) = matches[0];
+        t.scroll_to_absolute_line(abs_line);
+        let row = t.abs_line_to_viewport_row(abs_line).expect("match visible");
+        // The found line is the one now shown at that viewport row.
+        let line_text: String = (0..5)
+            .filter_map(|c| t.get_viewport_cell(c, row))
+            .map(|cell| cell.ch)
+            .collect();
+        assert!(line_text.contains("dd"), "got row text: {line_text:?}");
+    }
 }
