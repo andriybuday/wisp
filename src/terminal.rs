@@ -94,7 +94,10 @@ pub struct Terminal {
     sync_output: bool,
     /// Window title set via OSC 0 / OSC 2
     title: Option<String>,
-    /// Text selection range: (start_col, start_row, end_col, end_row)
+    /// Text selection range in absolute lines:
+    /// (start_col, start_abs_line, end_col, end_abs_line). Absolute line
+    /// indices address scrollback lines followed by grid rows (on the
+    /// alternate screen, just alt-grid rows).
     selection: Option<(usize, usize, usize, usize)>,
     /// Scrollback offset (0 = at bottom, >0 = scrolled up)
     scroll_offset: usize,
@@ -166,6 +169,7 @@ impl Terminal {
         if self.scrollback.len() > limit {
             let excess = self.scrollback.len() - limit;
             self.scrollback.drain(..excess);
+            self.shift_selection_lines(excess);
         }
     }
 
@@ -221,6 +225,7 @@ impl Terminal {
         self.pending_wrap = false;
         if enabled {
             if !self.on_alt {
+                self.selection = None;
                 self.alt_entry_cursor = self.cursor;
                 self.on_alt = true;
                 for cell in &mut self.alt_grid {
@@ -231,6 +236,7 @@ impl Terminal {
                 }
             }
         } else if self.on_alt {
+            self.selection = None;
             self.on_alt = false;
             self.cursor = (
                 self.alt_entry_cursor.0.min(self.cols.saturating_sub(1)),
@@ -242,6 +248,9 @@ impl Terminal {
     /// DECSET/DECRST ?47: switch buffers, no cursor save, no clear.
     pub fn set_alt_screen_47(&mut self, enabled: bool) {
         self.pending_wrap = false;
+        if enabled != self.on_alt {
+            self.selection = None;
+        }
         self.on_alt = enabled;
     }
 
@@ -250,8 +259,14 @@ impl Terminal {
     pub fn set_alt_screen_1047(&mut self, enabled: bool) {
         self.pending_wrap = false;
         if enabled {
+            if !self.on_alt {
+                self.selection = None;
+            }
             self.on_alt = true;
         } else {
+            if self.on_alt {
+                self.selection = None;
+            }
             for cell in &mut self.alt_grid {
                 *cell = Cell::default();
             }
@@ -1008,6 +1023,7 @@ impl Terminal {
                 self.scrollback.push((line, flag));
                 if self.scrollback.len() > self.scrollback_limit {
                     self.scrollback.remove(0);
+                    self.shift_selection_lines(1);
                 }
             }
         }
@@ -1200,48 +1216,217 @@ impl Terminal {
         }
     }
 
-    // Selection methods
+    // Selection methods (absolute lines; public API takes viewport rows)
 
-    pub fn set_selection_start(&mut self, col: usize, row: usize) {
-        self.selection = Some((col, row, col, row));
-    }
-
-    pub fn set_selection_end(&mut self, col: usize, row: usize) {
-        if let Some((start_col, start_row, _, _)) = self.selection {
-            self.selection = Some((start_col, start_row, col, row));
+    /// Convert a viewport row to an absolute line, using the same math
+    /// as `get_viewport_cell`.
+    fn viewport_to_abs_line(&self, viewport_row: usize) -> usize {
+        if self.on_alt || self.scroll_offset == 0 {
+            let base = if self.on_alt {
+                0
+            } else {
+                self.scrollback.len()
+            };
+            base + viewport_row.min(self.rows.saturating_sub(1))
+        } else {
+            let total_rows = self.scrollback.len() + self.rows;
+            let viewport_start = total_rows.saturating_sub(self.rows + self.scroll_offset);
+            (viewport_start + viewport_row).min(total_rows.saturating_sub(1))
         }
     }
 
-    // Kept for upcoming Spec Kit features.
+    /// Cell at an absolute line (scrollback first, then the active grid).
+    fn get_absolute_cell(&self, col: usize, abs_line: usize) -> Option<&Cell> {
+        if col >= self.cols {
+            return None;
+        }
+        if self.on_alt {
+            self.get_cell(col, abs_line)
+        } else if abs_line < self.scrollback.len() {
+            self.scrollback
+                .get(abs_line)
+                .and_then(|line| line.0.get(col))
+        } else {
+            self.get_cell(col, abs_line - self.scrollback.len())
+        }
+    }
+
+    fn normalized_selection(&self) -> Option<(usize, usize, usize, usize)> {
+        let (sc, sl, ec, el) = self.selection?;
+        if (sl, sc) <= (el, ec) {
+            Some((sc, sl, ec, el))
+        } else {
+            Some((ec, el, sc, sl))
+        }
+    }
+
+    /// Shift stored selection lines down by `n` (oldest lines trimmed).
+    fn shift_selection_lines(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        if let Some((sc, sl, ec, el)) = self.selection {
+            self.selection = Some((sc, sl.saturating_sub(n), ec, el.saturating_sub(n)));
+        }
+    }
+
+    fn clamp_col_row(&self, col: usize, row: usize) -> (usize, usize) {
+        (
+            col.min(self.cols.saturating_sub(1)),
+            row.min(self.rows.saturating_sub(1)),
+        )
+    }
+
+    pub fn set_selection_start(&mut self, col: usize, row: usize) {
+        if self.cols == 0 || self.rows == 0 {
+            self.selection = None;
+            return;
+        }
+        let (col, row) = self.clamp_col_row(col, row);
+        let abs = self.viewport_to_abs_line(row);
+        self.selection = Some((col, abs, col, abs));
+    }
+
+    pub fn set_selection_end(&mut self, col: usize, row: usize) {
+        if self.cols == 0 || self.rows == 0 {
+            return;
+        }
+        if let Some((start_col, start_abs, _, _)) = self.selection {
+            let (col, row) = self.clamp_col_row(col, row);
+            let abs = self.viewport_to_abs_line(row);
+            self.selection = Some((start_col, start_abs, col, abs));
+        }
+    }
+
     #[allow(dead_code)]
     pub fn clear_selection(&mut self) {
         self.selection = None;
     }
 
-    // Kept for upcoming Spec Kit features.
+    /// Clear the selection only when it is a single cell at the given
+    /// viewport position (a no-drag click released where it started).
+    pub fn clear_selection_if_single_cell(&mut self, col: usize, row: usize) {
+        if self.cols == 0 || self.rows == 0 {
+            return;
+        }
+        let (col, row) = self.clamp_col_row(col, row);
+        let abs = self.viewport_to_abs_line(row);
+        if self.selection == Some((col, abs, col, abs)) {
+            self.selection = None;
+        }
+    }
+
     #[allow(dead_code)]
     pub fn selection(&self) -> Option<(usize, usize, usize, usize)> {
         self.selection
     }
 
     pub fn is_cell_selected(&self, col: usize, row: usize) -> bool {
-        if let Some((start_col, start_row, end_col, end_row)) = self.selection {
-            // Normalize the selection (start before end)
-            let (start_col, start_row, end_col, end_row) =
-                if start_row < end_row || (start_row == end_row && start_col <= end_col) {
-                    (start_col, start_row, end_col, end_row)
-                } else {
-                    (end_col, end_row, start_col, start_row)
-                };
-
-            let cell_pos = row * self.cols + col;
-            let start_pos = start_row * self.cols + start_col;
-            let end_pos = end_row * self.cols + end_col;
-
-            cell_pos >= start_pos && cell_pos <= end_pos
-        } else {
-            false
+        let Some((sc, sl, ec, el)) = self.normalized_selection() else {
+            return false;
+        };
+        if self.cols == 0 || self.rows == 0 {
+            return false;
         }
+        let abs = self.viewport_to_abs_line(row);
+        (sl, sc) <= (abs, col) && (abs, col) <= (el, ec)
+    }
+
+    /// Select the word at a viewport cell: expand over word characters
+    /// (alphanumeric or `_-./~:@`); a spacer belongs to its wide char.
+    /// Clicking a space selects the contiguous space run; clicking any
+    /// other character selects just that cell (plus spacer when wide).
+    pub fn select_word_at(&mut self, col: usize, viewport_row: usize) {
+        if self.cols == 0 || self.rows == 0 {
+            self.selection = None;
+            return;
+        }
+        let (col, viewport_row) = self.clamp_col_row(col, viewport_row);
+        let abs = self.viewport_to_abs_line(viewport_row);
+        let cell_at = |c: usize| self.get_absolute_cell(c, abs).copied();
+        let Some(clicked) = cell_at(col) else {
+            self.selection = None;
+            return;
+        };
+        // A clicked spacer belongs to the wide char on its left.
+        let (head, head_cell) = if clicked.flags.contains(CellFlags::WIDE_SPACER) && col > 0 {
+            (col - 1, cell_at(col - 1).unwrap_or(clicked))
+        } else {
+            (col, clicked)
+        };
+        let wide_head = |c: usize| -> bool {
+            cell_at(c + 1)
+                .map(|cell| cell.flags.contains(CellFlags::WIDE_SPACER))
+                .unwrap_or(false)
+        };
+        let cell_end = |c: usize| if wide_head(c) { c + 1 } else { c };
+        let is_word = |ch: char| ch.is_alphanumeric() || "_-./~:@".contains(ch);
+        let is_word_cell =
+            |cell: &Cell| !cell.flags.contains(CellFlags::WIDE_SPACER) && is_word(cell.ch);
+        let is_space_cell =
+            |cell: &Cell| cell.ch == ' ' && !cell.flags.contains(CellFlags::WIDE_SPACER);
+
+        let (start, end) = if is_word(head_cell.ch) {
+            let mut start = head;
+            while start > 0 {
+                let prev = start - 1;
+                let Some(pc) = cell_at(prev) else { break };
+                if pc.flags.contains(CellFlags::WIDE_SPACER) {
+                    // prev is the spacer of the cell before it.
+                    if prev == 0 {
+                        break;
+                    }
+                    let Some(hc) = cell_at(prev - 1) else { break };
+                    if !is_word_cell(&hc) {
+                        break;
+                    }
+                    start = prev - 1;
+                } else if is_word_cell(&pc) {
+                    start = prev;
+                } else {
+                    break;
+                }
+            }
+            let mut end = cell_end(head);
+            while let Some(nc) = cell_at(end + 1) {
+                if nc.flags.contains(CellFlags::WIDE_SPACER) || !is_word_cell(&nc) {
+                    break;
+                }
+                end = cell_end(end + 1);
+            }
+            (start, end)
+        } else if is_space_cell(&head_cell) {
+            let mut start = head;
+            while start > 0 {
+                let Some(pc) = cell_at(start - 1) else { break };
+                if !is_space_cell(&pc) {
+                    break;
+                }
+                start -= 1;
+            }
+            let mut end = head;
+            while let Some(nc) = cell_at(end + 1) {
+                if !is_space_cell(&nc) {
+                    break;
+                }
+                end += 1;
+            }
+            (start, end)
+        } else {
+            (head, cell_end(head))
+        };
+        self.selection = Some((start, abs, end, abs));
+    }
+
+    /// Select the full absolute line under a viewport row.
+    pub fn select_line_at(&mut self, viewport_row: usize) {
+        if self.cols == 0 || self.rows == 0 {
+            self.selection = None;
+            return;
+        }
+        let row = viewport_row.min(self.rows.saturating_sub(1));
+        let abs = self.viewport_to_abs_line(row);
+        self.selection = Some((0, abs, self.cols - 1, abs));
     }
 
     // Scrollback methods
@@ -1300,52 +1485,40 @@ impl Terminal {
     }
 
     pub fn get_selected_text(&self) -> String {
-        if let Some((start_col, start_row, end_col, end_row)) = self.selection {
-            // Normalize the selection (start before end)
-            let (start_col, start_row, end_col, end_row) =
-                if start_row < end_row || (start_row == end_row && start_col <= end_col) {
-                    (start_col, start_row, end_col, end_row)
-                } else {
-                    (end_col, end_row, start_col, start_row)
-                };
-
+        let Some((start_col, start_line, end_col, end_line)) = self.normalized_selection() else {
+            return String::new();
+        };
+        if self.cols == 0 {
+            return String::new();
+        }
+        let mut lines: Vec<String> = Vec::new();
+        for line in start_line..=end_line {
+            let line_start = if line == start_line { start_col } else { 0 };
+            let line_end = if line == end_line {
+                end_col.min(self.cols - 1)
+            } else {
+                self.cols - 1
+            };
+            if line_start > line_end {
+                lines.push(String::new());
+                continue;
+            }
             let mut text = String::new();
-
-            for row in start_row..=end_row {
-                if row >= self.rows {
-                    break;
-                }
-
-                let line_start = if row == start_row { start_col } else { 0 };
-                let line_end = if row == end_row {
-                    end_col
-                } else {
-                    self.cols - 1
-                };
-
-                for col in line_start..=line_end {
-                    if col >= self.cols {
-                        break;
+            for col in line_start..=line_end {
+                if let Some(cell) = self.get_absolute_cell(col, line) {
+                    // Spacers are the second half of a wide char;
+                    // copied text must not gain an inserted space.
+                    if !cell.flags.contains(CellFlags::WIDE_SPACER) {
+                        text.push(cell.ch);
                     }
-                    if let Some(cell) = self.get_cell(col, row) {
-                        // Spacers are the second half of a wide char;
-                        // copied text must not gain an inserted space.
-                        if !cell.flags.contains(CellFlags::WIDE_SPACER) {
-                            text.push(cell.ch);
-                        }
-                    }
-                }
-
-                // Add newline if not on the last row
-                if row < end_row {
-                    text.push('\n');
                 }
             }
-
-            text
-        } else {
-            String::new()
+            while text.ends_with(' ') {
+                text.pop();
+            }
+            lines.push(text);
         }
+        lines.join("\n")
     }
 }
 
@@ -1672,6 +1845,180 @@ mod tests {
         let t = term(4, 2);
         assert_eq!(t.get_selected_text(), "");
         assert!(!t.is_cell_selected(0, 0));
+    }
+
+    #[test]
+    fn selection_scrolled_up_copies_scrollback_text() {
+        let mut t = term(5, 2);
+        print_str(&mut t, "ab");
+        t.linefeed();
+        print_str(&mut t, "cd");
+        t.linefeed();
+        assert_eq!(t.scrollback.len(), 1);
+        t.scroll_viewport_up(1);
+        // Viewport row 0 now shows the scrollback line "ab".
+        t.set_selection_start(0, 0);
+        t.set_selection_end(1, 0);
+        assert!(t.is_cell_selected(0, 0));
+        assert!(!t.is_cell_selected(0, 1));
+        assert_eq!(t.get_selected_text(), "ab");
+        // Scrolling back down does not change what was selected.
+        t.scroll_viewport_down(1);
+        assert!(!t.is_cell_selected(0, 0));
+        assert_eq!(t.get_selected_text(), "ab");
+    }
+
+    #[test]
+    fn selection_survives_push_into_scrollback() {
+        let mut t = term(5, 2);
+        print_str(&mut t, "ab");
+        t.set_selection_start(0, 0);
+        t.set_selection_end(1, 0);
+        assert_eq!(t.get_selected_text(), "ab");
+        t.linefeed();
+        print_str(&mut t, "cd");
+        t.linefeed();
+        assert_eq!(t.scrollback.len(), 1);
+        assert_eq!(t.get_cell(0, 0).unwrap().ch, 'c');
+        assert_eq!(t.get_selected_text(), "ab");
+    }
+
+    #[test]
+    fn selected_text_trims_trailing_spaces_keeps_inner() {
+        let mut t = term(10, 3);
+        print_str(&mut t, "a b");
+        t.linefeed();
+        print_str(&mut t, "cd");
+        t.set_selection_start(0, 0);
+        t.set_selection_end(9, 1);
+        assert_eq!(t.get_selected_text(), "a b\ncd");
+    }
+
+    #[test]
+    fn word_select_expands_over_word_chars_and_stops() {
+        let mut t = term(24, 2);
+        print_str(&mut t, "  foo@bar-baz/qux1.txt z");
+        t.select_word_at(5, 0);
+        assert_eq!(t.get_selected_text(), "foo@bar-baz/qux1.txt");
+        assert!(!t.is_cell_selected(1, 0));
+        // Stops at characters outside the word set.
+        let mut t = term(10, 2);
+        print_str(&mut t, "(hi) *x");
+        t.select_word_at(2, 0);
+        assert_eq!(t.get_selected_text(), "hi");
+        // A non-word, non-space character selects just itself.
+        t.select_word_at(0, 0);
+        assert_eq!(t.get_selected_text(), "(");
+    }
+
+    #[test]
+    fn word_select_on_space_selects_space_run() {
+        let mut t = term(10, 2);
+        print_str(&mut t, "ab   cd");
+        t.select_word_at(3, 0);
+        assert_eq!(t.selection(), Some((2, 0, 4, 0)));
+        assert!(t.is_cell_selected(2, 0));
+        assert!(t.is_cell_selected(4, 0));
+        assert!(!t.is_cell_selected(1, 0));
+        assert!(!t.is_cell_selected(5, 0));
+    }
+
+    #[test]
+    fn word_select_on_wide_char_includes_spacer() {
+        let mut t = term(10, 2);
+        t.print('a');
+        t.print('\u{754C}');
+        t.print('b');
+        // Click the spacer cell (col 2) of the wide char at col 1.
+        t.select_word_at(2, 0);
+        assert!(t.is_cell_selected(1, 0));
+        assert!(t.is_cell_selected(2, 0));
+        assert_eq!(t.get_selected_text(), "a\u{754C}b");
+        t.select_word_at(1, 0);
+        assert!(t.is_cell_selected(2, 0));
+        assert_eq!(t.get_selected_text(), "a\u{754C}b");
+    }
+
+    #[test]
+    fn line_select_covers_full_line() {
+        let mut t = term(5, 3);
+        print_str(&mut t, "ab");
+        t.linefeed();
+        print_str(&mut t, "cd");
+        t.select_line_at(0);
+        assert!(t.is_cell_selected(0, 0));
+        assert!(t.is_cell_selected(4, 0));
+        assert!(!t.is_cell_selected(0, 1));
+        assert_eq!(t.get_selected_text(), "ab");
+    }
+
+    #[test]
+    fn alt_screen_switch_clears_selection() {
+        let mut t = term(5, 2);
+        print_str(&mut t, "ab");
+        t.set_selection_start(0, 0);
+        t.set_selection_end(1, 0);
+        t.set_alt_screen_1049(true);
+        assert_eq!(t.selection(), None);
+        assert_eq!(t.get_selected_text(), "");
+        // Selections work within the alt grid, then leaving clears.
+        t.cursor_goto(0, 0);
+        print_str(&mut t, "xy");
+        t.set_selection_start(0, 0);
+        t.set_selection_end(1, 0);
+        assert_eq!(t.get_selected_text(), "xy");
+        t.set_alt_screen_1049(false);
+        assert_eq!(t.selection(), None);
+        assert_eq!(t.get_cell(0, 0).unwrap().ch, 'a');
+    }
+
+    #[test]
+    fn scrollback_trim_shifts_selection_without_panic() {
+        // Trim via set_scrollback_limit: same text stays selected.
+        let mut t = term(5, 2);
+        print_str(&mut t, "aa");
+        t.linefeed();
+        print_str(&mut t, "bb");
+        t.linefeed();
+        print_str(&mut t, "cc");
+        t.linefeed();
+        assert_eq!(t.scrollback.len(), 2);
+        t.set_selection_start(0, 0);
+        t.set_selection_end(1, 0);
+        assert_eq!(t.get_selected_text(), "cc");
+        t.set_scrollback_limit(1);
+        assert_eq!(t.scrollback.len(), 1);
+        assert_eq!(t.get_selected_text(), "cc");
+
+        // Trim via scroll push past the limit saturates, never panics.
+        let mut t = term(5, 2);
+        t.scrollback_limit = 1;
+        print_str(&mut t, "ab");
+        t.linefeed();
+        print_str(&mut t, "cd");
+        t.linefeed();
+        t.scroll_viewport_up(1);
+        t.set_selection_start(0, 0);
+        t.set_selection_end(1, 0);
+        assert_eq!(t.get_selected_text(), "ab");
+        t.scroll_viewport_down(1);
+        print_str(&mut t, "ef");
+        t.linefeed();
+        // "ab" was trimmed; the saturated selection now covers "cd".
+        assert_eq!(t.get_selected_text(), "cd");
+    }
+
+    #[test]
+    fn clear_selection_if_single_cell_only_clears_no_drag() {
+        let mut t = term(5, 2);
+        print_str(&mut t, "ab");
+        t.set_selection_start(1, 0);
+        t.clear_selection_if_single_cell(1, 0);
+        assert_eq!(t.selection(), None);
+        t.set_selection_start(0, 0);
+        t.set_selection_end(1, 0);
+        t.clear_selection_if_single_cell(1, 0);
+        assert_eq!(t.get_selected_text(), "ab");
     }
     #[test]
     fn alt_screen_1049_saves_and_restores_cursor_and_grid() {

@@ -36,6 +36,11 @@ pub struct WispWindow {
     clipboard: Option<arboard::Clipboard>,
     last_title: Option<String>,
     mouse_pressed: bool,
+    /// Click counting for double/triple-click word/line select: time
+    /// and viewport cell of the last counted press, and its count.
+    last_click_time: Option<Instant>,
+    last_click_cell: Option<(usize, usize)>,
+    click_count: u32,
     last_mouse_position: Option<PhysicalPosition<f64>>,
     /// Last cell sent in a mouse report, for per-cell motion dedupe.
     last_reported_cell: Option<(usize, usize)>,
@@ -181,6 +186,9 @@ impl WispWindow {
             clipboard,
             last_title: None,
             mouse_pressed: false,
+            last_click_time: None,
+            last_click_cell: None,
+            click_count: 0,
             last_mouse_position: None,
             last_reported_cell: None,
             cell_width,
@@ -470,15 +478,42 @@ impl WispWindow {
         if button != MouseButton::Left {
             return;
         }
-        self.mouse_pressed = true;
 
         // Convert physical position to grid coordinates
-        if let Some(position) = self.last_mouse_position {
-            if let Some((col, row)) = self.position_to_grid(position) {
+        let Some(position) = self.last_mouse_position else {
+            return;
+        };
+        let Some((col, row)) = self.position_to_grid(position) else {
+            return;
+        };
+
+        // Click counting: a press within 400 ms on the same viewport
+        // cell increments the count; anything else resets it.
+        let now = Instant::now();
+        let quick = matches!(self.last_click_time, Some(t) if now.duration_since(t) <= Duration::from_millis(400));
+        if self.last_click_cell == Some((col, row)) && quick {
+            self.click_count += 1;
+        } else {
+            self.click_count = 1;
+        }
+        self.last_click_time = Some(now);
+        self.last_click_cell = Some((col, row));
+
+        match self.click_count {
+            2 => {
+                self.mouse_pressed = false;
+                self.parser.terminal_mut().select_word_at(col, row);
+            }
+            3.. => {
+                self.mouse_pressed = false;
+                self.parser.terminal_mut().select_line_at(row);
+            }
+            _ => {
+                self.mouse_pressed = true;
                 self.parser.terminal_mut().set_selection_start(col, row);
-                self.window.request_redraw();
             }
         }
+        self.window.request_redraw();
     }
 
     /// Handle cursor motion: reported per the tracking level (button-event
@@ -541,6 +576,18 @@ impl WispWindow {
 
         if button == MouseButton::Left {
             self.mouse_pressed = false;
+            // A plain click released on the cell it started on (no
+            // drag) clears the single-cell selection it created.
+            if self.click_count == 1 {
+                if let Some((col, row)) = self
+                    .last_mouse_position
+                    .and_then(|pos| self.position_to_grid(pos))
+                {
+                    self.parser
+                        .terminal_mut()
+                        .clear_selection_if_single_cell(col, row);
+                }
+            }
         }
     }
 
