@@ -11,19 +11,33 @@ pub struct PtyManager {
 }
 
 impl PtyManager {
+    // Retained as the no-override constructor; the window uses `with_shell`.
+    #[allow(dead_code)]
     pub fn new(cols: u16, rows: u16) -> Result<Self, Box<dyn std::error::Error>> {
-        // Get shell from environment or use default
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+        Self::with_shell(cols, rows, None)
+    }
+
+    /// Spawn `shell` if given, else `$SHELL` (then `/bin/bash`).
+    pub fn with_shell(
+        cols: u16,
+        rows: u16,
+        shell: Option<String>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        // Configured shell, else environment, else default
+        let shell = shell
+            .filter(|s| !s.is_empty())
+            .or_else(|| std::env::var("SHELL").ok().filter(|s| !s.is_empty()))
+            .unwrap_or_else(|| "/bin/bash".to_string());
         log::debug!("Spawning shell: {}", shell);
 
         let cmd = CommandBuilder::new(&shell);
         Self::spawn_with_command(cols, rows, cmd)
     }
 
-    /// Spawn an arbitrary command in a new PTY. Shared by `new` (user shell),
-    /// tests (custom commands), and a future shell-override caller. Sets the
-    /// terminal environment (`TERM`, `TERM_PROGRAM`, `TERM_PROGRAM_VERSION`)
-    /// on every command spawned through here.
+    /// Spawn an arbitrary command in a new PTY. Shared by `with_shell` (user
+    /// shell) and tests (custom commands). Sets the terminal environment
+    /// (`TERM`, `TERM_PROGRAM`, `TERM_PROGRAM_VERSION`) on every command
+    /// spawned through here, and retains the child so `has_exited` can poll it.
     pub(crate) fn spawn_with_command(
         cols: u16,
         rows: u16,

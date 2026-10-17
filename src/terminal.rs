@@ -111,6 +111,15 @@ impl Terminal {
         }
     }
 
+    /// Set the scrollback cap (from config), trimming the oldest lines.
+    pub fn set_scrollback_limit(&mut self, limit: usize) {
+        self.scrollback_limit = limit;
+        if self.scrollback.len() > limit {
+            let excess = self.scrollback.len() - limit;
+            self.scrollback.drain(..excess);
+        }
+    }
+
     fn active_grid(&self) -> &Vec<Cell> {
         if self.on_alt {
             &self.alt_grid
@@ -968,6 +977,23 @@ mod tests {
             t.linefeed();
         }
         assert_eq!(t.scrollback.len(), 2);
+    }
+
+    #[test]
+    fn set_scrollback_limit_trims() {
+        let mut t = term(2, 2);
+        for ch in ['a', 'b', 'c', 'd', 'e'] {
+            t.print(ch);
+            t.linefeed();
+        }
+        assert!(t.scrollback.len() > 2);
+        let newest = t.scrollback.last().unwrap()[0].ch;
+        t.set_scrollback_limit(2);
+        assert_eq!(t.scrollback_limit, 2);
+        assert_eq!(t.scrollback.len(), 2);
+        assert_eq!(t.scrollback.last().unwrap()[0].ch, newest); // oldest dropped
+        t.set_scrollback_limit(10);
+        assert_eq!(t.scrollback.len(), 2); // raising the cap keeps content
     }
 
     #[test]
