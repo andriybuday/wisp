@@ -34,6 +34,8 @@ bitflags::bitflags! {
         const ITALIC = 0b0010;
         const UNDERLINE = 0b0100;
         const INVERSE = 0b1000;
+        /// Second cell of a wide (width-2) character; `ch` is `' '`.
+        const WIDE_SPACER = 0b0001_0000;
     }
 }
 
@@ -299,24 +301,96 @@ impl Terminal {
 
     // ANSI control functions
 
+    /// Blank one cell: `ch` becomes `' '` and `WIDE_SPACER` is removed,
+    /// but colors (and other flags) are kept.
+    fn blank_cell_at(&mut self, col: usize, row: usize) {
+        let cols = self.cols;
+        let cell = &mut self.active_grid_mut()[row * cols + col];
+        cell.ch = ' ';
+        cell.flags.remove(CellFlags::WIDE_SPACER);
+    }
+
+    /// Overwrite hygiene for one cell about to be written: if it is a
+    /// spacer, blank the wide char to its left; else if the next cell is
+    /// a spacer (this cell is a wide head), blank that spacer. This
+    /// keeps half of a wide pair from being stranded by an overwrite.
+    fn blank_wide_neighbor(&mut self, col: usize, row: usize) {
+        let idx = row * self.cols + col;
+        if self.active_grid()[idx]
+            .flags
+            .contains(CellFlags::WIDE_SPACER)
+        {
+            if col > 0 {
+                self.blank_cell_at(col - 1, row);
+            }
+        } else if col + 1 < self.cols
+            && self.active_grid()[idx + 1]
+                .flags
+                .contains(CellFlags::WIDE_SPACER)
+        {
+            self.blank_cell_at(col + 1, row);
+        }
+    }
+
     pub fn print(&mut self, ch: char) {
+        use unicode_width::UnicodeWidthChar;
+
+        // Width-0 chars (combining marks, ZWJ/ZWSP, controls reported as
+        // None) are dropped entirely: no cell change, no cursor advance.
+        // Grapheme composition is a documented non-goal (see 006 spec).
+        let width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width == 0 {
+            return;
+        }
+
         // Reset scroll offset when new content arrives
         self.scroll_offset = 0;
 
+        if self.cols == 0 || self.rows == 0 {
+            return;
+        }
+
+        // A wide char cannot fit in the last column: wrap first, using
+        // the same linefeed path as an ordinary end-of-line wrap.
+        if width >= 2 && self.cols >= 2 && self.cursor.0 == self.cols - 1 {
+            self.linefeed();
+        }
+
         let (col, row) = self.cursor;
-        if col < self.cols && row < self.rows {
-            let cell = Cell {
-                ch,
-                fg: self.current_fg,
-                bg: self.current_bg,
-                flags: self.current_flags,
+        if col >= self.cols || row >= self.rows {
+            return;
+        }
+
+        let cell = Cell {
+            ch,
+            fg: self.current_fg,
+            bg: self.current_bg,
+            flags: self.current_flags,
+        };
+        let cols = self.cols;
+        if width >= 2 && col + 1 < cols {
+            self.blank_wide_neighbor(col, row);
+            self.blank_wide_neighbor(col + 1, row);
+            // The spacer copies fg/bg/flags so backgrounds and inverse
+            // video render continuously across both columns.
+            let spacer = Cell {
+                ch: ' ',
+                flags: cell.flags | CellFlags::WIDE_SPACER,
+                ..cell
             };
-            let cols = self.cols;
+            let grid = self.active_grid_mut();
+            grid[row * cols + col] = cell;
+            grid[row * cols + col + 1] = spacer;
+            self.cursor.0 += 2;
+        } else {
+            // Width 1 exactly as before (also the degenerate 1-column
+            // fallback for a wide char, which has no room for a spacer).
+            self.blank_wide_neighbor(col, row);
             self.active_grid_mut()[row * cols + col] = cell;
             self.cursor.0 += 1;
-            if self.cursor.0 >= self.cols {
-                self.linefeed();
-            }
+        }
+        if self.cursor.0 >= self.cols {
+            self.linefeed();
         }
     }
 
@@ -810,7 +884,11 @@ impl Terminal {
                         break;
                     }
                     if let Some(cell) = self.get_cell(col, row) {
-                        text.push(cell.ch);
+                        // Spacers are the second half of a wide char;
+                        // copied text must not gain an inserted space.
+                        if !cell.flags.contains(CellFlags::WIDE_SPACER) {
+                            text.push(cell.ch);
+                        }
                     }
                 }
 
@@ -1315,5 +1393,146 @@ mod tests {
         assert_eq!(t.scroll_region(), (1, 2));
         assert_eq!(t.get_cell(0, 0).unwrap().ch, 'a');
         assert!(t.get_cell(0, 4).is_none());
+    }
+
+    #[test]
+    fn wide_char_occupies_two_cells_with_spacer() {
+        // U+754C is a wide CJK char: head cell + spacer, cursor +2, and
+        // the spacer copies fg/bg/flags from the wide cell.
+        let mut t = term(10, 3);
+        t.sgr(31);
+        t.sgr(42);
+        t.sgr(7);
+        t.print('\u{754C}');
+        let head = t.get_cell(0, 0).unwrap();
+        assert_eq!(head.ch, '\u{754C}');
+        assert_eq!((head.fg, head.bg), (Color::Indexed(1), Color::Indexed(2)));
+        assert!(head.flags.contains(CellFlags::INVERSE));
+        assert!(!head.flags.contains(CellFlags::WIDE_SPACER));
+        let spacer = t.get_cell(1, 0).unwrap();
+        assert_eq!(spacer.ch, ' ');
+        assert_eq!(
+            (spacer.fg, spacer.bg),
+            (Color::Indexed(1), Color::Indexed(2))
+        );
+        assert!(spacer
+            .flags
+            .contains(CellFlags::INVERSE | CellFlags::WIDE_SPACER));
+        assert_eq!(t.cursor(), (2, 0));
+    }
+
+    #[test]
+    fn emoji_is_width_two() {
+        // U+1F980 (crab emoji) is width 2.
+        let mut t = term(10, 2);
+        t.print('\u{1F980}');
+        assert_eq!(t.get_cell(0, 0).unwrap().ch, '\u{1F980}');
+        assert!(t
+            .get_cell(1, 0)
+            .unwrap()
+            .flags
+            .contains(CellFlags::WIDE_SPACER));
+        assert_eq!(t.cursor(), (2, 0));
+    }
+
+    #[test]
+    fn wide_char_at_last_column_wraps_to_next_line() {
+        let mut t = term(4, 3);
+        print_str(&mut t, "abc");
+        assert_eq!(t.cursor(), (3, 0));
+        t.print('\u{754C}');
+        assert_eq!(t.get_cell(3, 0).unwrap().ch, ' ');
+        assert_eq!(t.get_cell(0, 1).unwrap().ch, '\u{754C}');
+        assert!(t
+            .get_cell(1, 1)
+            .unwrap()
+            .flags
+            .contains(CellFlags::WIDE_SPACER));
+        assert_eq!(t.cursor(), (2, 1));
+    }
+
+    #[test]
+    fn wide_char_filling_line_end_wraps_cursor_immediately() {
+        // Immediate wrap (not deferred): filling the last two columns
+        // moves the cursor to the next line start right away.
+        let mut t = term(4, 3);
+        t.cursor_goto(2, 0);
+        t.print('\u{754C}');
+        assert_eq!(t.get_cell(2, 0).unwrap().ch, '\u{754C}');
+        assert!(t
+            .get_cell(3, 0)
+            .unwrap()
+            .flags
+            .contains(CellFlags::WIDE_SPACER));
+        assert_eq!(t.cursor(), (0, 1));
+    }
+
+    #[test]
+    fn overwriting_spacer_blanks_wide_char() {
+        let mut t = term(10, 2);
+        t.sgr(31);
+        t.print('\u{754C}');
+        t.sgr(32);
+        t.cursor_goto(1, 0);
+        t.print('x');
+        let blanked = t.get_cell(0, 0).unwrap();
+        assert_eq!(blanked.ch, ' ');
+        // Blanking keeps the wide cell's colors.
+        assert_eq!(blanked.fg, Color::Indexed(1));
+        let x = t.get_cell(1, 0).unwrap();
+        assert_eq!(x.ch, 'x');
+        assert_eq!(x.fg, Color::Indexed(2));
+        assert!(!x.flags.contains(CellFlags::WIDE_SPACER));
+        assert_eq!(t.cursor(), (2, 0));
+    }
+
+    #[test]
+    fn overwriting_wide_char_blanks_spacer() {
+        let mut t = term(10, 2);
+        t.sgr(31);
+        t.sgr(42);
+        t.print('\u{754C}');
+        t.sgr(32);
+        t.cursor_goto(0, 0);
+        t.print('x');
+        let x = t.get_cell(0, 0).unwrap();
+        assert_eq!(x.ch, 'x');
+        assert_eq!(x.fg, Color::Indexed(2));
+        let blanked = t.get_cell(1, 0).unwrap();
+        assert_eq!(blanked.ch, ' ');
+        assert!(!blanked.flags.contains(CellFlags::WIDE_SPACER));
+        // Blanking keeps the spacer's (copied) colors.
+        assert_eq!(
+            (blanked.fg, blanked.bg),
+            (Color::Indexed(1), Color::Indexed(2))
+        );
+        assert_eq!(t.cursor(), (1, 0));
+    }
+
+    #[test]
+    fn zero_width_space_is_dropped() {
+        // U+200B changes no cell and does not advance the cursor.
+        let mut t = term(10, 2);
+        t.print('a');
+        t.print('\u{200B}');
+        assert_eq!(t.cursor(), (1, 0));
+        assert_eq!(t.get_cell(0, 0).unwrap().ch, 'a');
+        assert_eq!(t.get_cell(1, 0).unwrap().ch, ' ');
+        assert!(t.get_cell(1, 0).unwrap().flags.is_empty());
+        t.print('b');
+        assert_eq!(t.get_cell(1, 0).unwrap().ch, 'b');
+        assert_eq!(t.cursor(), (2, 0));
+    }
+
+    #[test]
+    fn selected_text_skips_wide_spacers() {
+        let mut t = term(10, 2);
+        t.print('a');
+        t.print('\u{754C}');
+        t.print('b');
+        assert_eq!(t.cursor(), (4, 0));
+        t.set_selection_start(0, 0);
+        t.set_selection_end(3, 0);
+        assert_eq!(t.get_selected_text(), "a\u{754C}b");
     }
 }

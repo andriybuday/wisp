@@ -662,6 +662,20 @@ mod tests {
     }
 
     #[test]
+    fn cjk_utf8_through_parser_lands_in_expected_cells() {
+        // UTF-8 bytes for "a" + U+754C + "b": the wide char takes cells
+        // 1-2 (head + spacer), so "b" lands in cell 3.
+        let p = run("a\u{754C}b".as_bytes());
+        assert_eq!(p.terminal().get_cell(0, 0).unwrap().ch, 'a');
+        assert_eq!(p.terminal().get_cell(1, 0).unwrap().ch, '\u{754C}');
+        let spacer = p.terminal().get_cell(2, 0).unwrap();
+        assert_eq!(spacer.ch, ' ');
+        assert!(spacer.flags.contains(CellFlags::WIDE_SPACER));
+        assert_eq!(p.terminal().get_cell(3, 0).unwrap().ch, 'b');
+        assert_eq!(p.terminal().cursor(), (4, 0));
+    }
+
+    #[test]
     fn merged_256color_inside_scroll_region() {
         // 003 indexed-256 color printed inside a 002 scroll region.
         let p = run(b"\x1b[2;3r\x1b[38;5;196mX");
