@@ -116,6 +116,9 @@ fn main() {
                 }
             }
             Event::AboutToWait => {
+                if wisp_window.shell_exited() {
+                    elwt.exit();
+                }
                 wisp_window.window().request_redraw();
             }
             _ => {}

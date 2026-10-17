@@ -130,6 +130,12 @@ impl WispWindow {
         self.renderer.render(self.parser.terminal());
     }
 
+    /// Has the shell (PTY child) exited? The event loop closes the window
+    /// when this becomes true.
+    pub fn shell_exited(&mut self) -> bool {
+        self.pty.has_exited()
+    }
+
     pub fn send_input(&mut self, data: &[u8]) {
         let _ = self.pty.write(data);
     }
