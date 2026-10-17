@@ -10,7 +10,18 @@ pub struct PtyManager {
 }
 
 impl PtyManager {
+    // Retained as the no-override constructor; the window uses `with_shell`.
+    #[allow(dead_code)]
     pub fn new(cols: u16, rows: u16) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::with_shell(cols, rows, None)
+    }
+
+    /// Spawn `shell` if given, else `$SHELL` (then `/bin/bash`).
+    pub fn with_shell(
+        cols: u16,
+        rows: u16,
+        shell: Option<String>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let pty_system = NativePtySystem::default();
 
         let pty_size = PtySize {
@@ -22,8 +33,11 @@ impl PtyManager {
 
         let pair = pty_system.openpty(pty_size)?;
 
-        // Get shell from environment or use default
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+        // Configured shell, else environment, else default
+        let shell = shell
+            .filter(|s| !s.is_empty())
+            .or_else(|| std::env::var("SHELL").ok().filter(|s| !s.is_empty()))
+            .unwrap_or_else(|| "/bin/bash".to_string());
 
         let mut cmd = CommandBuilder::new(&shell);
         cmd.env("TERM", "xterm-256color");

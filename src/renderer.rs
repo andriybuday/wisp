@@ -277,7 +277,7 @@ impl Renderer {
             config,
             size,
             pipeline,
-            color_palette: ColorPalette::default(),
+            color_palette: ColorPalette::from_config(terminal_config),
             padding: terminal_config.padding * scale,
             font_manager,
             texture,

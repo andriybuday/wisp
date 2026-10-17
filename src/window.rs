@@ -25,7 +25,7 @@ pub struct WispWindow {
 
 impl WispWindow {
     pub fn new(event_loop: &EventLoop<()>) -> Self {
-        let config = Config::default();
+        let config = Config::load();
 
         // Calculate initial window size based on terminal grid.
         // These are logical (point) dimensions; winit scales them to physical
@@ -52,10 +52,12 @@ impl WispWindow {
         window.set_ime_allowed(true);
 
         let renderer = Renderer::new(window.clone(), &config);
-        let terminal = Terminal::new(config.cols, config.rows);
+        let mut terminal = Terminal::new(config.cols, config.rows);
+        terminal.set_scrollback_limit(config.scrollback_lines.clamp(100, 100_000));
         let parser = AnsiParser::new(terminal);
         let pty =
-            PtyManager::new(config.cols as u16, config.rows as u16).expect("Failed to create PTY");
+            PtyManager::with_shell(config.cols as u16, config.rows as u16, config.shell.clone())
+                .expect("Failed to create PTY");
 
         let clipboard = arboard::Clipboard::new()
             .map_err(|e| log::warn!("Clipboard unavailable: {e}"))
